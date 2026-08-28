@@ -115,3 +115,27 @@ model visitors {
 
   @@index([shop_domain], map: "idx_visitors_shop")
 }
+
+model shopify_sessions {
+  id                  String   @id @db.VarChar(255)
+  shop                String   @db.VarChar(255)
+  state               String   @db.VarChar(255)
+  isOnline            Boolean
+  scope               String?  @db.VarChar(1024)
+  expires             Int?
+  accessToken         String?  @db.VarChar(255)
+  refreshToken        String?  @db.VarChar(255)
+  refreshTokenExpires BigInt?
+  userId              BigInt?
+  firstName           String?  @db.VarChar(255)
+  lastName            String?  @db.VarChar(255)
+  email               String?  @db.VarChar(255)
+  accountOwner        Boolean?
+  locale              String?  @db.VarChar(255)
+  collaborator        Boolean?
+  emailVerified       Boolean?
+}
+
+model shopify_sessions_migrations {
+  migration_name String @id @db.VarChar(255)
+}
