@@ -5,6 +5,7 @@ import type {
   LoaderFunctionArgs,
 } from "react-router";
 import { useFetcher } from "react-router";
+import type { action as activatePixelAction } from "./app.pixel";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
@@ -143,6 +144,17 @@ export default function Index() {
 
   const generateProduct = () => fetcher.submit({}, { method: "POST" });
 
+  const pixelFetcher = useFetcher<typeof activatePixelAction>();
+  const isPixelLoading =
+    ["loading", "submitting"].includes(pixelFetcher.state) &&
+    pixelFetcher.formMethod === "POST";
+
+  const enableTracking = () =>
+    pixelFetcher.submit(
+      { intent: "activate_pixel" },
+      { method: "POST", action: "/app/pixel" },
+    );
+
   return (
     <s-page heading="Shopify app template">
       <s-button slot="primary-action" onClick={generateProduct}>
@@ -276,6 +288,40 @@ export default function Index() {
               </s-box>
             </s-stack>
           </s-section>
+        )}
+      </s-section>
+
+      <s-section heading="Event tracking">
+        <s-paragraph>
+          Enable the PD web pixel to start capturing raw storefront events
+          (page views, product views, searches, collection views, add-to-cart
+          and purchases) into the events table.
+        </s-paragraph>
+        <s-stack direction="inline" gap="base">
+          <s-button
+            onClick={enableTracking}
+            {...(isPixelLoading ? { loading: true } : {})}
+          >
+            Enable tracking
+          </s-button>
+        </s-stack>
+        {pixelFetcher.data && (
+          <s-box
+            padding="base"
+            borderWidth="base"
+            borderRadius="base"
+            background="subdued"
+          >
+            <pre
+              style={{
+                margin: 0,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}
+            >
+              <code>{JSON.stringify(pixelFetcher.data, null, 2)}</code>
+            </pre>
+          </s-box>
         )}
       </s-section>
 

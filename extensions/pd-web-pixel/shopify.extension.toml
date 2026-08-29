@@ -1,0 +1,10 @@
+[settings]
+type = "object"
+
+[settings.fields.apiUrl]
+name = "API URL"
+description = "Full URL of the PD event ingestion endpoint that receives storefront customer events"
+type = "single_line_text_field"
+validations = [
+  { name = "min", value = "1" }
+]
