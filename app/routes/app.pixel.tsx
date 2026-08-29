@@ -25,16 +25,16 @@ export async function action({ request }: ActionFunctionArgs) {
   const apiUrl = `${appUrl.replace(/\/+$/, "")}/api/events`;
   const settings = { apiUrl };
 
-  const existingResponse = await admin.graphql(`#graphql
-    query {
-      webPixel {
-        id
-        settings
-      }
-    }`);
-  const existingJson = await existingResponse.json();
+  // One web pixel exists per app per store. The webPixel query throws a
+  // GraphQL-level error when none exists yet (verified against the live Admin
+  // API: HTTP 200 with errors[{message: "No web pixel was found for this
+  // app.", extensions.code: "RESOURCE_NOT_FOUND"}] and data.webPixel: null;
+  // shopify-api v13's GraphqlClient.request() rethrows that as
+  // GraphqlQueryError whose message is the first GraphQL error message), so
+  // treat that specific error as "none exists" and fall through to create.
+  const existingPixel = await fetchExistingPixel(admin);
 
-  if (existingJson?.data?.webPixel) {
+  if (existingPixel) {
     const updateResponse = await admin.graphql(
       `#graphql
       mutation webPixelUpdate($id: ID!, $webPixel: WebPixelInput!) {
@@ -51,7 +51,7 @@ export async function action({ request }: ActionFunctionArgs) {
       }`,
       {
         variables: {
-          id: existingJson.data.webPixel.id,
+          id: existingPixel.id,
           webPixel: { settings },
         },
       },
@@ -104,4 +104,79 @@ export async function action({ request }: ActionFunctionArgs) {
     message: "Tracking enabled — the pixel is now active on this store.",
     pixel: createJson.data.webPixelCreate.webPixel,
   };
+}
+
+const NO_WEB_PIXEL_ERROR_MESSAGE = "No web pixel was found for this app";
+
+interface AdminClient {
+  graphql: (
+    query: string,
+    options?: { variables?: Record<string, unknown> },
+  ) => Promise<Response>;
+}
+
+interface WebPixelRecord {
+  id: string;
+  settings: string;
+}
+
+/**
+ * Queries for this app's existing web pixel. Returns null when none exists
+ * yet — including when Shopify signals that via the "No web pixel was found
+ * for this app" GraphQL error (see the comment at the call site). Any other
+ * failure still throws so it surfaces normally.
+ */
+async function fetchExistingPixel(
+  admin: AdminClient,
+): Promise<WebPixelRecord | null> {
+  try {
+    const existingResponse = await admin.graphql(`#graphql
+      query {
+        webPixel {
+          id
+          settings
+        }
+      }`);
+    const existingJson = (await existingResponse.json()) as {
+      data?: { webPixel?: WebPixelRecord | null };
+      errors?: Array<{ message?: string }>;
+    };
+
+    // Defensive: if a future client version ever stops throwing on GraphQL
+    // errors and returns them in the body instead, handle that shape here.
+    if (existingJson.errors?.length) {
+      if (
+        existingJson.errors.some((entry) =>
+          String(entry.message).includes(NO_WEB_PIXEL_ERROR_MESSAGE),
+        )
+      ) {
+        return null;
+      }
+      throw new Error(
+        `webPixel query failed: ${existingJson.errors
+          .map((entry) => String(entry.message))
+          .join("; ")}`,
+      );
+    }
+
+    return existingJson.data?.webPixel ?? null;
+  } catch (error) {
+    if (!isNoWebPixelError(error)) {
+      throw error;
+    }
+    return null;
+  }
+}
+
+function isNoWebPixelError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  if (error.message.includes(NO_WEB_PIXEL_ERROR_MESSAGE)) {
+    return true;
+  }
+  // GraphqlQueryError from @shopify/shopify-api carries the full response
+  // body on .body — match against it as a fallback.
+  const body = (error as { body?: unknown }).body;
+  return JSON.stringify(body ?? "").includes(NO_WEB_PIXEL_ERROR_MESSAGE);
 }

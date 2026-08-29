@@ -7,6 +7,7 @@ name = "pd-web-pixel"
 handle = "pd-web-pixel"
 description = "PD product discovery tracking pixel: captures storefront customer events and posts them to the app's ingestion endpoint"
 runtime_context = "strict"
+uid = "8b86b8f8-c3b3-37f5-275e-ea255cf81b41fa8488ab"
 
 [customer_privacy]
 # PD is an internal analytics/experimentation pixel only (per shopify.dev/docs/api/customer-privacy:
