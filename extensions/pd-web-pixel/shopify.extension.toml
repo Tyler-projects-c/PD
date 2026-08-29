@@ -9,10 +9,13 @@ description = "PD product discovery tracking pixel: captures storefront customer
 runtime_context = "strict"
 
 [customer_privacy]
+# PD is an internal analytics/experimentation pixel only (per shopify.dev/docs/api/customer-privacy:
+# analytics = "customer analytics about how the storefront was used and interactions
+# made on the storefront"). No marketing retargeting, no data sale/sharing.
 analytics = true
-marketing = true
-preferences = true
-sale_of_data = "enabled"
+marketing = false
+preferences = false
+sale_of_data = "disabled"
 
 [settings]
 type = "object"
