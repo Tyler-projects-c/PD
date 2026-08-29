@@ -1,3 +1,19 @@
+# PD web pixel extension (new unified extension config format).
+# Reference: https://shopify.dev/docs/apps/build/extensions/extension-configs
+api_version = "2026-01"
+
+type = "web_pixel_extension"
+name = "pd-web-pixel"
+handle = "pd-web-pixel"
+description = "PD product discovery tracking pixel: captures storefront customer events and posts them to the app's ingestion endpoint"
+runtime_context = "strict"
+
+[customer_privacy]
+analytics = true
+marketing = true
+preferences = true
+sale_of_data = "enabled"
+
 [settings]
 type = "object"
 
