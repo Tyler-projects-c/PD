@@ -10,6 +10,20 @@ import { authenticate } from "../shopify.server";
  * uses for every event POST. A store can only have one web pixel per app, so
  * an existing record is updated instead of created.
  */
+const WEB_PIXEL_UPDATE_MUTATION = `#graphql
+  mutation webPixelUpdate($id: ID!, $webPixel: WebPixelInput!) {
+    webPixelUpdate(id: $id, webPixel: $webPixel) {
+      webPixel {
+        id
+        settings
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }`;
+
 export async function action({ request }: ActionFunctionArgs) {
   const { admin } = await authenticate.admin(request);
 
@@ -35,27 +49,12 @@ export async function action({ request }: ActionFunctionArgs) {
   const existingPixel = await fetchExistingPixel(admin);
 
   if (existingPixel) {
-    const updateResponse = await admin.graphql(
-      `#graphql
-      mutation webPixelUpdate($id: ID!, $webPixel: WebPixelInput!) {
-        webPixelUpdate(id: $id, webPixel: $webPixel) {
-          webPixel {
-            id
-            settings
-          }
-          userErrors {
-            field
-            message
-          }
-        }
-      }`,
-      {
-        variables: {
-          id: existingPixel.id,
-          webPixel: { settings },
-        },
+    const updateResponse = await admin.graphql(WEB_PIXEL_UPDATE_MUTATION, {
+      variables: {
+        id: existingPixel.id,
+        webPixel: { settings },
       },
-    );
+    });
     const updateJson = await updateResponse.json();
     const userErrors = updateJson?.data?.webPixelUpdate?.userErrors ?? [];
     if (userErrors.length > 0) {
@@ -179,4 +178,93 @@ function isNoWebPixelError(error: unknown): boolean {
   // body on .body — match against it as a fallback.
   const body = (error as { body?: unknown }).body;
   return JSON.stringify(body ?? "").includes(NO_WEB_PIXEL_ERROR_MESSAGE);
+}
+
+export interface PixelResyncResult {
+  status: "no-pixel" | "in-sync" | "resynced" | "skipped" | "error";
+  apiUrl?: string;
+  message?: string;
+}
+
+/**
+ * Keeps the pixel's stored apiUrl aligned with the app's current URL.
+ *
+ * `shopify app dev` gets a new Cloudflare tunnel URL on every start, which
+ * would silently strand the pixel's stored apiUrl (events POST to a dead
+ * URL). This runs from the app-home loader only — it issues a write ONLY
+ * when the stored apiUrl actually drifted from the current
+ * SHOPIFY_APP_URL, so steady-state loads cost one cheap read (or a skip).
+ * First-time creation still happens via the manual "Enable tracking" button.
+ *
+ * Never throws: callers render the returned status instead of crashing.
+ */
+export async function resyncPixelApiUrl(
+  admin: AdminClient,
+): Promise<PixelResyncResult> {
+  const appUrl = process.env.SHOPIFY_APP_URL;
+  if (!appUrl) {
+    return {
+      status: "skipped",
+      message: "SHOPIFY_APP_URL is not set",
+    };
+  }
+  const expectedApiUrl = `${appUrl.replace(/\/+$/, "")}/api/events`;
+
+  try {
+    const existing = await fetchExistingPixel(admin);
+    if (!existing) {
+      return { status: "no-pixel" };
+    }
+
+    const currentApiUrl = extractApiUrl(existing.settings);
+    if (currentApiUrl === expectedApiUrl) {
+      return { status: "in-sync", apiUrl: currentApiUrl ?? undefined };
+    }
+
+    const updateResponse = await admin.graphql(WEB_PIXEL_UPDATE_MUTATION, {
+      variables: {
+        id: existing.id,
+        webPixel: { settings: { apiUrl: expectedApiUrl } },
+      },
+    });
+    const updateJson = (await updateResponse.json()) as {
+      data?: {
+        webPixelUpdate?: {
+          userErrors?: Array<{ message: string }>;
+        };
+      };
+    };
+    const userErrors = updateJson.data?.webPixelUpdate?.userErrors ?? [];
+    if (userErrors.length > 0) {
+      return {
+        status: "error",
+        message: userErrors.map((e) => e.message).join("; "),
+      };
+    }
+    return { status: "resynced", apiUrl: expectedApiUrl };
+  } catch (error) {
+    console.error(
+      "[app.pixel] apiUrl resync failed:",
+      error instanceof Error ? error.message : error,
+    );
+    return {
+      status: "error",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function extractApiUrl(settings: string | null | undefined): string | null {
+  if (!settings) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(settings) as { apiUrl?: unknown };
+    return typeof parsed.apiUrl === "string" ? parsed.apiUrl : null;
+  } catch {
+    // Shopify settings strings are not guaranteed to be strict JSON; fall
+    // back to a targeted match so a drifted URL is still detected.
+    const match = settings.match(/"apiUrl"\s*:\s*"([^"]+)"/);
+    return match ? match[1] : null;
+  }
 }

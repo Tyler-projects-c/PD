@@ -4,16 +4,24 @@ import type {
   HeadersFunction,
   LoaderFunctionArgs,
 } from "react-router";
-import { useFetcher } from "react-router";
+import { useFetcher, useLoaderData } from "react-router";
 import type { action as activatePixelAction } from "./app.pixel";
+import { resyncPixelApiUrl } from "./app.pixel";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+  const { admin } = await authenticate.admin(request);
 
-  return null;
+  // Dev tunnels change on every `npm run dev`, which would silently strand
+  // the web pixel's stored apiUrl (events would POST to a dead URL). Re-sync
+  // it on app-home load — this is the main loader only (not every route),
+  // and the helper writes ONLY when the stored URL actually drifted.
+  // First-time pixel creation still uses the manual "Enable tracking" button.
+  const pixelResync = await resyncPixelApiUrl(admin);
+
+  return { pixelResync };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -129,6 +137,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Index() {
+  const { pixelResync } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
 
   const shopify = useAppBridge();
@@ -297,6 +306,18 @@ export default function Index() {
           (page views, product views, searches, collection views, add-to-cart
           and purchases) into the events table.
         </s-paragraph>
+        {pixelResync.status === "resynced" && (
+          <s-paragraph>
+            Pixel apiUrl was automatically re-synced to the current app URL (
+            <s-text>{pixelResync.apiUrl}</s-text>) — no action needed.
+          </s-paragraph>
+        )}
+        {pixelResync.status === "error" && (
+          <s-paragraph>
+            Could not automatically re-sync the pixel apiUrl:{" "}
+            {pixelResync.message}
+          </s-paragraph>
+        )}
         <s-stack direction="inline" gap="base">
           <s-button
             onClick={enableTracking}
