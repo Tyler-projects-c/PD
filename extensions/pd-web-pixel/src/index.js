@@ -63,10 +63,22 @@ function extractNumericId(rawId) {
 
 register(({analytics, browser, init, settings}) => {
   const shopDomain = init?.data?.shop?.myshopifyDomain ?? "";
-  const apiUrl = settings?.apiUrl;
+  // Runtime settings (set via webPixelCreate/webPixelUpdate) are delivered on
+  // the register context as `settings`. Some runtimes also mirror them on
+  // init.data.settings — read both so a missing apiUrl is never silent.
+  const apiUrl = settings?.apiUrl ?? init?.data?.settings?.apiUrl;
+
+  console.log(
+    `PD pixel: register | shop=${shopDomain} | apiUrl=${apiUrl ?? "(missing)"} | ` +
+      `settingsKeys=${JSON.stringify(Object.keys(settings ?? {}))} | ` +
+      `initDataKeys=${JSON.stringify(Object.keys(init?.data ?? {}))}`,
+  );
 
   if (!apiUrl) {
-    console.log("PD pixel: settings.apiUrl is not configured; dropping events");
+    console.log(
+      "PD pixel: settings.apiUrl is not configured; dropping events — " +
+        "run the Enable tracking flow / auto-resync so the pixel gets its target URL.",
+    );
     return;
   }
 
@@ -75,8 +87,9 @@ register(({analytics, browser, init, settings}) => {
   // essential for checkout_completed (thank-you page).
   const sendEvent = (eventType, timestamp, extra = {}) => {
     getVisitorId(browser)
-      .then((visitorId) =>
-        fetch(apiUrl, {
+      .then((visitorId) => {
+        console.log(`PD pixel: sending ${eventType} -> ${apiUrl}`);
+        return fetch(apiUrl, {
           method: "POST",
           body: JSON.stringify({
             event_type: eventType,
@@ -86,8 +99,8 @@ register(({analytics, browser, init, settings}) => {
             ...extra,
           }),
           keepalive: true,
-        }),
-      )
+        });
+      })
       .catch((error) => {
         console.log(`PD pixel: failed to send ${eventType}`, error);
       });
@@ -133,4 +146,6 @@ register(({analytics, browser, init, settings}) => {
       })),
     });
   });
+
+  console.log("PD pixel: subscriptions registered");
 });

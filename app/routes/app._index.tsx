@@ -306,6 +306,13 @@ export default function Index() {
           (page views, product views, searches, collection views, add-to-cart
           and purchases) into the events table.
         </s-paragraph>
+        {pixelResync.status === "no-pixel" && (
+          <s-paragraph>
+            The PD web pixel is not registered on this store yet — click{" "}
+            &quot;Enable tracking&quot; below to create it (this also registers
+            it so the storefront can start sending events).
+          </s-paragraph>
+        )}
         {pixelResync.status === "resynced" && (
           <s-paragraph>
             Pixel apiUrl was automatically re-synced to the current app URL (

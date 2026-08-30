@@ -217,6 +217,9 @@ export async function resyncPixelApiUrl(
     }
 
     const currentApiUrl = extractApiUrl(existing.settings);
+    console.log(
+      `[app.pixel] resync check: stored apiUrl=${currentApiUrl ?? "(none)"} | expected=${expectedApiUrl}`,
+    );
     if (currentApiUrl === expectedApiUrl) {
       return { status: "in-sync", apiUrl: currentApiUrl ?? undefined };
     }
@@ -236,11 +239,19 @@ export async function resyncPixelApiUrl(
     };
     const userErrors = updateJson.data?.webPixelUpdate?.userErrors ?? [];
     if (userErrors.length > 0) {
+      console.warn(
+        `[app.pixel] resync rejected by Shopify: ${userErrors
+          .map((e) => e.message)
+          .join("; ")}`,
+      );
       return {
         status: "error",
         message: userErrors.map((e) => e.message).join("; "),
       };
     }
+    console.log(
+      `[app.pixel] resynced pixel apiUrl: ${currentApiUrl ?? "(none)"} -> ${expectedApiUrl}`,
+    );
     return { status: "resynced", apiUrl: expectedApiUrl };
   } catch (error) {
     console.error(
