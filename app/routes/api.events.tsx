@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { z } from "zod";
 import db from "../db.server";
+import { encryptToken } from "../utils/crypto.server";
 
 /**
  * Raw event ingestion endpoint for the PD web pixel (Phase 1).
@@ -115,6 +116,23 @@ function toDecimal(value: string | number | null | undefined): string | null {
   return Number.isFinite(asNumber) ? String(asNumber) : null;
 }
 
+async function ensureShop(shopDomain: string) {
+  // events/visitors carry FK constraints on shops.shop_domain. Normally the
+  // auth callback creates the shop row on install; if a real event arrives
+  // first (e.g. a dev store right after a DB reset), create a placeholder so
+  // ingestion never silently drops data. Stored encrypted at rest; auth.$.tsx
+  // replaces it with the real encrypted token on the next install/auth.
+  await db.shops.upsert({
+    where: { shop_domain: shopDomain },
+    update: {},
+    create: {
+      shop_domain: shopDomain,
+      access_token: encryptToken(""),
+      scopes: "",
+    },
+  });
+}
+
 async function ensureVisitor(visitorId: string, shopDomain: string) {
   await db.visitors.upsert({
     where: { visitor_id: visitorId },
@@ -125,6 +143,7 @@ async function ensureVisitor(visitorId: string, shopDomain: string) {
 
 async function persistEvent(payload: EventPayload) {
   const occurredAt = parseOccurredAt(payload.occurred_at);
+  await ensureShop(payload.shop_domain);
   await ensureVisitor(payload.visitor_id, payload.shop_domain);
 
   const baseFields = {
