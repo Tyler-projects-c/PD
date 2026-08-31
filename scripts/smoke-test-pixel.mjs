@@ -12,12 +12,16 @@
  *   npx playwright install chromium
  *
  * Usage (from repo root):
- *   $env:PD_STORE_PASSWORD='<store password>'    # only if storefront is locked
  *   node --env-file=.env scripts/smoke-test-pixel.mjs            # headless
  *   node --env-file=.env scripts/smoke-test-pixel.mjs --headed   # watch it
  *
+ * Storefront password (only needed while the store is behind a password page):
+ *   set PD_STORE_PASSWORD=<password> in .env (same file this script reads via
+ *   --env-file) so it persists across terminal sessions. A shell env var also
+ *   works and takes precedence over .env when both are set.
+ *
  * Env overrides:
- *   PD_STORE_PASSWORD  storefront password (required if the password page shows)
+ *   PD_STORE_PASSWORD  storefront password (from .env or a shell env var)
  *   PD_STORE_SHOP      store domain (default pd-test-ubhzd2gl.myshopify.com)
  *   PD_SEARCH_TERM     search term typed into the storefront search (default snowboard)
  *   PD_WAIT_MS         settle time for fire-and-forget POSTs (default 6000)
@@ -231,7 +235,8 @@ async function dismissPasswordPage(page) {
   if (!password) {
     console.error(
       "[smoke] FAIL: the storefront password page is showing but PD_STORE_PASSWORD " +
-        "is not set. Set it ($env:PD_STORE_PASSWORD='<password>') and re-run.",
+        "is not set. Add PD_STORE_PASSWORD=<password> to .env and re-run " +
+        "(a shell env var also works, but .env persists across sessions).",
     );
     await page.context().close();
     process.exit(2);
