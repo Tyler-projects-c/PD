@@ -31,7 +31,8 @@
  */
 
 import process from "node:process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { PrismaClient } from "@prisma/client";
 
 // Load .env if the script is run without --env-file=.env (never overrides
@@ -123,26 +124,70 @@ function extractApiUrl(settings) {
   }
 }
 
+// Resolve the app's public URL, in order of preference:
+//   1. process.env.SHOPIFY_APP_URL (set from .env via --env-file, or a real
+//      shell export).
+//   2. The current dev session's tunnel URL from the CLI's dev-bundle
+//      manifest. The Shopify CLI injects the live tunnel URL into the dev
+//      server's process env (HOST -> SHOPIFY_APP_URL in vite.config.ts) but
+//      does NOT persist it to .env, so a standalone process cannot see it
+//      there. The CLI does write it into .shopify/dev-bundle/manifest.json
+//      (app_home.config.app_url) on every `npm run dev`.
+function resolveAppUrl() {
+  const fromEnv = (process.env.SHOPIFY_APP_URL ?? "").replace(/\/+$/, "");
+  if (fromEnv) return fromEnv;
+  try {
+    const manifest = JSON.parse(
+      readFileSync(
+        path.join(process.cwd(), ".shopify", "dev-bundle", "manifest.json"),
+        "utf8",
+      ),
+    );
+    const appHome = (manifest.modules ?? []).find(
+      (mod) => mod.type === "app_home" && mod.config?.app_url,
+    );
+    if (appHome?.config?.app_url) return appHome.config.app_url.replace(/\/+$/, "");
+  } catch {
+    /* manifest missing/unreadable - fall through */
+  }
+  return "";
+}
+
 async function preflight() {
   log("--- pre-flight ---");
-  const appUrl = (process.env.SHOPIFY_APP_URL ?? "").replace(/\/+$/, "");
+  const appUrl = resolveAppUrl();
   if (!appUrl) {
     console.error(
-      "[smoke] FAIL: SHOPIFY_APP_URL is empty in .env. Start `npm run dev` so it " +
-        "writes the live tunnel URL, then re-run. (This test assumes dev is running.)",
+      "[smoke] FAIL: could not determine the app URL.\n" +
+        "  SHOPIFY_APP_URL is empty and .shopify/dev-bundle/manifest.json does not " +
+        "contain a tunnel URL.\n" +
+        "  Make sure `npm run dev` is running (it writes the manifest), then re-run.",
     );
     process.exit(2);
   }
   const apiUrl = `${appUrl}/api/events`;
 
-  // 1) Tunnel + app reachability.
+  // 1) Tunnel + app reachability. Our route answers GET with 405; a dead
+  //    Cloudflare tunnel answers 530 (origin unreachable at the edge).
   try {
     const r = await fetch(apiUrl, { method: "GET" });
-    log(`app endpoint reachable: ${apiUrl} -> HTTP ${r.status} (405 expected for GET)`);
+    if (r.status === 405) {
+      log(`app endpoint reachable: ${apiUrl} -> HTTP ${r.status} (405 expected)`);
+    } else {
+      console.error(
+        `[smoke] FAIL: ${apiUrl} responded HTTP ${r.status} (expected 405).\n` +
+          (r.status === 530
+            ? "  The current `npm run dev` tunnel is registered but not serving the app " +
+              "(stale/hung Cloudflare tunnel). Restart it: Ctrl+C in the dev terminal, " +
+              "run `npm run dev` again, then re-run this test."
+            : "  The app responded unexpectedly. Verify `npm run dev` is healthy, then re-run."),
+      );
+      process.exit(2);
+    }
   } catch (e) {
     console.error(
       `[smoke] FAIL: cannot reach ${apiUrl} (${e.cause?.code ?? e.message}). ` +
-        "Is `npm run dev` actually running?",
+        "Is `npm run dev` actually running? Restart it and re-run.",
     );
     process.exit(2);
   }
