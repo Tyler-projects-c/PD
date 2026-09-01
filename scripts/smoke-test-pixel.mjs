@@ -278,10 +278,21 @@ async function dismissPasswordPage(page) {
   if ((await pwInput.count()) === 0) return false;
   const password = process.env.PD_STORE_PASSWORD;
   if (!password) {
+    // Give a precise hint: did the user add an ACTIVE line, or only the
+    // commented placeholder that ships in .env?
+    let extraHint = "Add PD_STORE_PASSWORD=<password> to .env and re-run (a shell env var also works).";
+    try {
+      const envRaw = readFileSync(path.join(process.cwd(), ".env"), "utf8");
+      if (/^\s*#\s*PD_STORE_PASSWORD\s*=/m.test(envRaw)) {
+        extraHint =
+          "PD_STORE_PASSWORD is still the commented placeholder in .env " +
+          "(line starts with '#'). Uncomment it and replace <store password> " +
+          "with the real value, then re-run.";
+      }
+    } catch { /* .env unreadable - keep default hint */ }
     console.error(
       "[smoke] FAIL: the storefront password page is showing but PD_STORE_PASSWORD " +
-        "is not set. Add PD_STORE_PASSWORD=<password> to .env and re-run " +
-        "(a shell env var also works, but .env persists across sessions).",
+        "is not set. " + extraHint,
     );
     await page.context().close();
     process.exit(2);
