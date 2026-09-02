@@ -1,7 +1,7 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
-import { recordComplianceRequest } from "../utils/compliance.server";
+import { recordComplianceRequest, sanitizeCompliancePayload } from "../utils/compliance.server";
 
 const LOG_PREFIX = "[gdpr:data_request]";
 
@@ -26,6 +26,10 @@ const TOPIC = "customers/data_request";
  *
  * We log the receipt + what we found to compliance_requests (audit trail) and
  * return 200. HMAC verification is done automatically by authenticate.webhook.
+ *
+ * PII policy: Shopify's payload includes customer.email/phone, but the audit
+ * row persists an allow-listed, PII-free projection of the payload (see
+ * sanitizeCompliancePayload) — contact info is omitted entirely, never stored.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { shop, topic, payload } = await authenticate.webhook(request);
@@ -45,15 +49,26 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         })
       : [];
 
+    const customerId = (p.customer as Record<string, unknown> | undefined)?.id ?? null;
+
     await recordComplianceRequest({
       shopDomain: shop,
       topic: TOPIC,
-      payload: p,
+      // Allow-listed projection — customer.email/phone from the raw payload are
+      // NOT persisted (see sanitizeCompliancePayload for the keep/drop policy).
+      payload: sanitizeCompliancePayload({
+        shopDomain: shop,
+        customer: p.customer,
+        orders: p.orders_requested,
+        orderField: "orders_requested",
+        dataRequestId: p.data_request?.id,
+        matchedEventIds: matched.map((e) => e.event_id),
+      }),
       actionTaken:
-        `Data request received. Found ${matched.length} event row(s) linked to orders_requested=[${ordersRequested.join(",") || "-"}]. ` +
-        `No customer email/phone/customer_id stored by the app (no such columns). ` +
-        `Per Shopify GDPR flow the found data is made available to the store owner directly; the app sends no email to the customer. ` +
-        `Matched ids: ${matched.map((e) => e.event_id).join(",") || "none"}`,
+        `Data request received. Reported ${matched.length} order-linked event row(s) for customer_id=${customerId ?? "-"} ` +
+        `(orders: [${ordersRequested.join(",") || "-"}]). No PII fields persisted in this record. ` +
+        `Matched event ids: ${matched.map((e) => e.event_id).join(",") || "none"}. ` +
+        `Per Shopify GDPR flow the found data is made available to the store owner directly; the app sends no email to the customer.`,
     });
 
     console.log(

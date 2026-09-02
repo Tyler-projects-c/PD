@@ -33,11 +33,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   try {
     const result = await db.$transaction(
       async (tx) => {
-      // 1) Record receipt (atomic with the wipe below).
+      // 1) Record receipt (atomic with the wipe below). Allow-listed payload:
+      //    shop/redact carries no customer contact info (only shop ids), but
+      //    we persist an explicit projection anyway so any future Shopify
+      //    payload additions can never leak into the audit trail.
       const auditId = await recordComplianceRequest({
         shopDomain: shop,
         topic: TOPIC,
-        payload: p,
+        payload: { shop_domain: shop, shop_id: p.shop_id ?? null },
         actionTaken: "shop/redact received - erasing all PD data for this shop.",
         client: tx,
       });

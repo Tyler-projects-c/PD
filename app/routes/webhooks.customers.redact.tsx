@@ -1,7 +1,7 @@
 import type { ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
-import { recordComplianceRequest } from "../utils/compliance.server";
+import { recordComplianceRequest, sanitizeCompliancePayload } from "../utils/compliance.server";
 
 const LOG_PREFIX = "[gdpr:customers_redact]";
 
@@ -22,6 +22,10 @@ const TOPIC = "customers/redact";
  *
  * We delete the order-linked events, record the action in compliance_requests
  * (audit trail), and return 200. HMAC verification is automatic.
+ *
+ * PII policy: Shopify's payload includes customer.email/phone, but the audit
+ * row persists an allow-listed, PII-free projection of the payload (see
+ * sanitizeCompliancePayload) — contact info is omitted entirely, never stored.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { shop, topic, payload } = await authenticate.webhook(request);
@@ -40,13 +44,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       deleted = res.count;
     }
 
+    const customerId = (p.customer as Record<string, unknown> | undefined)?.id ?? null;
+
     await recordComplianceRequest({
       shopDomain: shop,
       topic: TOPIC,
-      payload: p,
+      // Allow-listed projection — customer.email/phone from the raw payload are
+      // NOT persisted (see sanitizeCompliancePayload for the keep/drop policy).
+      payload: sanitizeCompliancePayload({
+        shopDomain: shop,
+        customer: p.customer,
+        orders: p.orders_to_redact,
+        orderField: "orders_to_redact",
+        matchedEventIds: [],
+      }),
       actionTaken:
-        `Customer redaction. Deleted ${deleted} event row(s) linked to orders_to_redact=[${ordersToRedact.join(",") || "-"}]. ` +
-        `No customer email/phone/customer_id stored by the app. Anonymous visitor browsing data not tied to a customer identity was left intact.`,
+        `Customer redaction. Deleted ${deleted} event row(s) for customer_id=${customerId ?? "-"} ` +
+        `(orders: [${ordersToRedact.join(",") || "-"}]). No PII fields persisted in this record. ` +
+        `Anonymous visitor browsing data not tied to a customer identity was left intact.`,
     });
 
     console.log(`${LOG_PREFIX} ${shop} frameworkTopic=${topic} canonical=${TOPIC} orders=${ordersToRedact.length} deletedEvents=${deleted}`);
