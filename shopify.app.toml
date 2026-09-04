@@ -41,6 +41,17 @@ api_version = "2026-07"
 [auth]
 redirect_urls = [ ]
 
+# Storefront-facing app proxy: {shop}/apps/pd/* → <application_url>/api/proxy/*.
+# The theme treatment script (extensions/pd-treatment) calls /apps/pd/assign
+# same-origin to resolve a visitor's arm, so the theme never needs the app's
+# absolute URL. NOTE: `url` must stay in sync with the app's public URL (same
+# value as application_url — update both together when the tunnel/deploy URL
+# changes).
+[app_proxy]
+url = "https://example.com/api/proxy"
+subpath = "pd"
+prefix = "apps"
+
 [build]
 include_config_on_deploy = true
 automatically_update_urls_on_dev = true

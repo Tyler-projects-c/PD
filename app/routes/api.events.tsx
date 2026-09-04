@@ -12,6 +12,15 @@ import { assignVisitorToExperiment } from "../utils/experiments.server";
  * the web pixel sandbox has no session cookies, so the only callers are the
  * pixel and direct tests. Payloads are validated and FK-constrained by the
  * events table, so rows can only reference real shops/visitors.
+ *
+ * Visitor identity: the theme treatment script (extensions/pd-treatment) sets
+ * a first-party pd_visitor_id cookie on the shop domain, and the pixel sends
+ * events with credentials:"include". When that cookie is present it WINS over
+ * the payload's visitor_id — the sandboxed localStorage id is only a fallback
+ * for visitors without the cookie. This unification is what links tracked
+ * events to the same visitor identity the theme script used to resolve its
+ * experiment assignment (the pixel sandbox and the theme cannot see each
+ * other's storage).
  */
 
 const CORS_HEADERS: Record<string, string> = {
@@ -37,7 +46,10 @@ const lineItemSchema = z.object({
 
 const payloadSchema = z.object({
   event_type: z.enum(EVENT_TYPES),
-  visitor_id: z.string().uuid(),
+  // Optional in the payload: when the pd_visitor_id cookie is present it
+  // identifies the visitor instead. At least one of the two is required
+  // (enforced after parsing).
+  visitor_id: z.string().uuid().nullish(),
   shop_domain: z.string().min(1).max(255),
   product_id: z.string().min(1).max(255).nullish(),
   order_id: z.string().min(1).max(255).nullish(),
@@ -89,10 +101,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return jsonResponse({ error: "Invalid event payload" }, 400);
   }
 
+  // Identity resolution: the first-party pd_visitor_id cookie (set by the
+  // theme treatment script on the shop domain, forwarded by the pixel's
+  // credentialled fetch) wins; the payload's sandboxed localStorage id is the
+  // fallback. At least one must be present and be a valid UUID.
+  const cookieVisitorId = /(?:^|;\s*)pd_visitor_id=([0-9a-fA-F-]{36})/.exec(
+    request.headers.get("cookie") ?? "",
+  )?.[1];
+  const effectiveVisitorId = cookieVisitorId ?? parsed.data.visitor_id ?? null;
+  if (!effectiveVisitorId || !z.string().uuid().safeParse(effectiveVisitorId).success) {
+    console.warn(
+      "[api.events] rejected payload with no usable visitor identity (no cookie, no valid visitor_id)",
+    );
+    return jsonResponse({ error: "Invalid event payload" }, 400);
+  }
+
   // Respond immediately — ingestion must stay fast even if the database is
   // slow. Persistence failures are logged server-side instead of being
   // surfaced to the storefront sandbox.
-  void persistEvent(parsed.data).catch((error) => {
+  void persistEvent(parsed.data, effectiveVisitorId).catch((error) => {
     console.error(
       "[api.events] failed to persist event:",
       error instanceof Error ? error.message : error,
@@ -128,7 +155,7 @@ async function ensureVisitor(visitorId: string, shopDomain: string) {
   });
 }
 
-async function persistEvent(payload: EventPayload) {
+async function persistEvent(payload: EventPayload, effectiveVisitorId: string) {
   const occurredAt = parseOccurredAt(payload.occurred_at);
 
   // shops rows are created ONLY by the real OAuth install flow (auth.$.tsx):
@@ -137,7 +164,7 @@ async function persistEvent(payload: EventPayload) {
   // if the shop is missing, the visitor upsert below fails the
   // visitors_shop_domain_fkey FK constraint, which the action's catch logs as
   // "[api.events] failed to persist event: ..." so the gap stays loud.
-  await ensureVisitor(payload.visitor_id, payload.shop_domain);
+  await ensureVisitor(effectiveVisitorId, payload.shop_domain);
 
   // Experiment assignment (measurement only — no rendering effect): for
   // collection/search traffic, assign or re-read the visitor's arm for this
@@ -147,7 +174,7 @@ async function persistEvent(payload: EventPayload) {
   if (payload.surface && payload.surface_ref) {
     try {
       const assignment = await assignVisitorToExperiment(
-        payload.visitor_id,
+        effectiveVisitorId,
         payload.shop_domain,
         payload.surface,
         payload.surface_ref,
@@ -162,7 +189,7 @@ async function persistEvent(payload: EventPayload) {
   }
 
   const baseFields = {
-    visitor_id: payload.visitor_id,
+    visitor_id: effectiveVisitorId,
     shop_domain: payload.shop_domain,
     event_type: payload.event_type,
     occurred_at: occurredAt,

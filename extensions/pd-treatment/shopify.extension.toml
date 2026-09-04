@@ -1,0 +1,6 @@
+# PD theme app extension (placeholder treatment rendering).
+# Reference: https://shopify.dev/docs/apps/build/online-store/theme-app-extensions
+type = "theme"
+name = "pd-treatment"
+handle = "pd-treatment"
+description = "PD experiment pipeline proof: renders the PLACEHOLDER treatment (newest-first collection sort) for treatment-arm visitors"

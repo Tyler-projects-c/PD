@@ -3,10 +3,17 @@ import {register} from "@shopify/web-pixels-extension";
 // PD raw event tracking (Phase 1).
 //
 // Subscribes to the six standard customer events, attributes each one to a
-// persistent visitor id (kept in browser.localStorage), and POSTs a minimal
-// payload to the app's /api/events ingestion endpoint. The endpoint URL is
-// injected through the pixel `settings` (set via the webPixelCreate /
-// webPixelUpdate Admin API mutations).
+// persistent visitor id, and POSTs a minimal payload to the app's /api/events
+// ingestion endpoint. The endpoint URL is injected through the pixel
+// `settings` (set via the webPixelCreate / webPixelUpdate Admin API mutations).
+//
+// Visitor identity: events are sent with credentials:"include" so the
+// first-party pd_visitor_id cookie on the shop domain (set by the theme
+// treatment script, extensions/pd-treatment) reaches the server, which
+// prefers it over the id below. The sandboxed localStorage id is only a
+// fallback for visitors whose cookie is absent/blocked — this is what links
+// tracked events to the same visitor identity the theme script used to
+// resolve experiment assignments.
 
 const VISITOR_ID_KEY = "pd_visitor_id";
 
@@ -61,6 +68,16 @@ function extractNumericId(rawId) {
   return match ? match[1] : String(rawId);
 }
 
+// Surface ref for collection experiments is the collection HANDLE parsed from
+// the page URL — NOT the numeric collection id. The theme treatment script can
+// only see the URL, so both sides must derive the same surface_ref
+// independently for the rendering decision and the tracked events to resolve
+// to the SAME experiment instance.
+function extractCollectionHandle(href) {
+  const match = String(href || "").match(/\/collections\/([^\/?#]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 register(({analytics, browser, init, settings}) => {
   const shopDomain = init?.data?.shop?.myshopifyDomain ?? "";
   // Runtime settings (set via webPixelCreate/webPixelUpdate) are delivered on
@@ -89,17 +106,25 @@ register(({analytics, browser, init, settings}) => {
     getVisitorId(browser)
       .then((visitorId) => {
         console.log(`PD pixel: sending ${eventType} -> ${apiUrl}`);
+        const body = JSON.stringify({
+          event_type: eventType,
+          visitor_id: visitorId,
+          shop_domain: shopDomain,
+          occurred_at: timestamp,
+          ...extra,
+        });
+        // credentials:"include" carries the shop-domain pd_visitor_id cookie
+        // (set by the theme treatment script) so the server can unify visitor
+        // identity across pixel events and experiment assignments. If the
+        // credentialled request is rejected (cookie restrictions, CORS edge
+        // cases), retry once WITHOUT credentials so event delivery never
+        // regresses — the payload's visitor_id is the fallback identity.
         return fetch(apiUrl, {
           method: "POST",
-          body: JSON.stringify({
-            event_type: eventType,
-            visitor_id: visitorId,
-            shop_domain: shopDomain,
-            occurred_at: timestamp,
-            ...extra,
-          }),
+          body,
           keepalive: true,
-        });
+          credentials: "include",
+        }).catch(() => fetch(apiUrl, { method: "POST", body, keepalive: true }));
       })
       .catch((error) => {
         console.log(`PD pixel: failed to send ${eventType}`, error);
@@ -127,10 +152,12 @@ register(({analytics, browser, init, settings}) => {
   });
 
   analytics.subscribe("collection_viewed", (event) => {
-    // surface_ref is the collection id: per-collection experiment instances.
+    // surface_ref is the collection HANDLE from the page URL (see
+    // extractCollectionHandle) — must match what the theme treatment script
+    // computes so both sides use the same experiment instance.
     sendEvent("collection_viewed", event.timestamp, {
       surface: "collection",
-      surface_ref: extractNumericId(event.data?.collection?.id),
+      surface_ref: extractCollectionHandle(event.context?.document?.location?.href),
     });
   });
 
