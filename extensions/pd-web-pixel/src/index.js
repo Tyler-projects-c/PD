@@ -117,11 +117,21 @@ register(({analytics, browser, init, settings}) => {
   });
 
   analytics.subscribe("search_submitted", (event) => {
-    sendEvent("search_submitted", event.timestamp);
+    // surface_ref is the raw search query: each distinct query is its own
+    // experiment instance (the server assigns per surface_ref).
+    const query = event.data?.searchResult?.query ?? null;
+    sendEvent("search_submitted", event.timestamp, {
+      surface: "search",
+      surface_ref: query,
+    });
   });
 
   analytics.subscribe("collection_viewed", (event) => {
-    sendEvent("collection_viewed", event.timestamp);
+    // surface_ref is the collection id: per-collection experiment instances.
+    sendEvent("collection_viewed", event.timestamp, {
+      surface: "collection",
+      surface_ref: extractNumericId(event.data?.collection?.id),
+    });
   });
 
   analytics.subscribe("product_added_to_cart", (event) => {

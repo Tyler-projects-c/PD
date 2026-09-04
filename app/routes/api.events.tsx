@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { z } from "zod";
 import db from "../db.server";
+import { assignVisitorToExperiment } from "../utils/experiments.server";
 
 /**
  * Raw event ingestion endpoint for the PD web pixel (Phase 1).
@@ -42,6 +43,10 @@ const payloadSchema = z.object({
   order_id: z.string().min(1).max(255).nullish(),
   revenue: z.union([z.string(), z.number()]).nullish(),
   occurred_at: z.string().nullish(),
+  // Present on collection/search events: which surface the visitor is on and
+  // what identifies that surface instance (collection id / search query).
+  surface: z.enum(["collection", "search"]).nullish(),
+  surface_ref: z.string().min(1).max(255).nullish(),
   line_items: z.array(lineItemSchema).max(200).nullish(),
 });
 
@@ -134,11 +139,36 @@ async function persistEvent(payload: EventPayload) {
   // "[api.events] failed to persist event: ..." so the gap stays loud.
   await ensureVisitor(payload.visitor_id, payload.shop_domain);
 
+  // Experiment assignment (measurement only — no rendering effect): for
+  // collection/search traffic, assign or re-read the visitor's arm for this
+  // exact surface instance. Failure here must never drop the event — the row
+  // is simply stored without a variant and the error is logged.
+  let variant: string | null = null;
+  if (payload.surface && payload.surface_ref) {
+    try {
+      const assignment = await assignVisitorToExperiment(
+        payload.visitor_id,
+        payload.shop_domain,
+        payload.surface,
+        payload.surface_ref,
+      );
+      variant = assignment?.variant ?? null;
+    } catch (error) {
+      console.error(
+        "[api.events] experiment assignment failed (event still persisted):",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
   const baseFields = {
     visitor_id: payload.visitor_id,
     shop_domain: payload.shop_domain,
     event_type: payload.event_type,
     occurred_at: occurredAt,
+    surface: payload.surface ?? null,
+    surface_ref: payload.surface_ref ?? null,
+    variant,
   };
 
   const lineItems = payload.line_items ?? [];
