@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { z } from "zod";
 import db from "../db.server";
+import { authenticate } from "../shopify.server";
 import { assignVisitorToExperiment } from "../utils/experiments.server";
 
 /**
@@ -25,9 +26,20 @@ import { assignVisitorToExperiment } from "../utils/experiments.server";
  * usable answer (no active experiment for the surface, missing fields, shop
  * not installed, DB error) — the theme script treats that as "default order".
  *
- * NOTE: the real app proxy signs forwarded requests (signature/timestamp
- * params) and sets X-Shopify-Shop-Domain. Verifying that signature is a
- * TODO before this endpoint is production-facing.
+ * SECURITY — proxy signature verification (mandatory, runs FIRST):
+ * Shopify app-proxy requests are signed with a `signature` query parameter —
+ * an HMAC-SHA256 (hex) over the sorted `key=value` concatenation of every
+ * other query param, keyed with the app's API secret, plus a `timestamp`
+ * param that must be within ±90s of the server clock. authenticate.public
+ * .appProxy(request) (the Shopify library, in ../shopify.server) performs
+ * exactly this validation with a timing-safe comparison. Any request whose
+ * signature is missing, forged, stale, or otherwise invalid is rejected with
+ * 401 BEFORE any visitor/assignment logic runs — an unverified caller cannot
+ * read or create assignment rows, and cannot make the app write one.
+ *
+ * Returns { variant, experiment_id }; variant is null whenever there is no
+ * usable answer (shop not installed, unknown fields, DB error) — the theme
+ * script treats that as "default order".
  */
 
 const requestSchema = z.object({
@@ -38,6 +50,23 @@ const requestSchema = z.object({
 });
 
 async function handle(request: Request): Promise<Response> {
+  // Gate EVERYTHING behind proxy signature verification. The library throws a
+  // bare Response (400) when the signature is missing/invalid/stale; we
+  // normalize that to 401 per this endpoint's contract. Non-Response errors
+  // (e.g. DB problems in the session lookup) are re-thrown so they are never
+  // misreported as signature failures.
+  try {
+    await authenticate.public.appProxy(request);
+  } catch (error) {
+    if (error instanceof Response) {
+      return Response.json(
+        { variant: null, experiment_id: null, error: "invalid_signature" },
+        { status: 401 },
+      );
+    }
+    throw error;
+  }
+
   const url = new URL(request.url);
   const raw: Record<string, unknown> = {};
   url.searchParams.forEach((value, key) => {
@@ -53,11 +82,17 @@ async function handle(request: Request): Promise<Response> {
       // fall through to schema validation, which reports the failure
     }
   }
-  // The real app proxy identifies the shop via this header — it wins over any
-  // caller-supplied value.
+  // Shop identity, all signature-backed: the app proxy adds a signed `shop`
+  // query param (it is part of the HMAC Shopify computed), and forwards
+  // X-Shopify-Shop-Domain. The signed `shop` param wins; the header is a
+  // fallback for proxies that only set the header. A caller-supplied
+  // shop_domain value is only honored if it arrived via the SIGNED query
+  // params (it did, if present there).
+  const proxyShop = url.searchParams.get("shop");
   const headerShopDomain = request.headers.get("x-shopify-shop-domain");
-  if (headerShopDomain) {
-    raw.shop_domain = headerShopDomain;
+  const shopDomain = proxyShop ?? headerShopDomain ?? (raw.shop_domain as string | undefined);
+  if (shopDomain) {
+    raw.shop_domain = shopDomain;
   }
 
   const parsed = requestSchema.safeParse(raw);

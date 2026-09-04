@@ -10,9 +10,12 @@
  *
  * What it does, on every page (app embed block, see blocks/pd_treatment_embed.liquid):
  *   1. Ensures a first-party visitor identity cookie (pd_visitor_id) exists on
- *      the shop domain. The web pixel cannot share its sandboxed localStorage,
- *      so this cookie is the shared identity that links rendering decisions
- *      and tracked events to the same visitor.
+ *      the shop domain and PUBLISHES it to the web pixel via Shopify's
+ *      documented custom-event bridge (Shopify.analytics.publish). The pixel
+ *      POSTs directly to the app backend — a different origin — so this
+ *      explicit hand-off is the only way the pixel can send the SAME visitor
+ *      id the assignment decision used (cookies on the shop domain never
+ *      attach to the pixel's cross-origin requests).
  *   2. On a collection page, asks the app (same-origin via the app proxy,
  *      /apps/pd/assign -> app /api/proxy/assign) which arm the visitor is in
  *      for that collection. This uses the SAME assignVisitorToExperiment()
@@ -38,6 +41,9 @@
   var COOKIE_NAME = "pd_visitor_id";
   var COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365; // 1 year
   var ASSIGN_PATH = "/apps/pd/assign"; // app proxy -> /api/proxy/assign
+  // Custom event consumed by the web pixel (extensions/pd-web-pixel). Must
+  // stay in sync with BRIDGE_EVENT there.
+  var BRIDGE_EVENT = "pd:visitor_identified";
 
   /** "/collections/frontpage?..." -> "frontpage"; null when not a collection page. */
   function parseCollectionHandle(pathname) {
@@ -140,12 +146,34 @@
       });
   }
 
-  var handle = parseCollectionHandle(window.location.pathname);
-  if (!handle) {
-    return; // not a collection page — nothing to do on this page
+  /**
+   * Hands the cookie-derived visitor id to the web pixel over Shopify's
+   * custom-event bridge: Shopify.analytics.publish(event, data) on the page
+   * arrives in the pixel as event.customData. Runs on EVERY page (before the
+   * collection-page early return) so product/cart pages feed the pixel too.
+   */
+  function publishVisitorIdentity(visitorId) {
+    try {
+      var analytics = window.Shopify && window.Shopify.analytics;
+      if (analytics && typeof analytics.publish === "function") {
+        analytics.publish(BRIDGE_EVENT, { visitor_id: visitorId });
+        console.log("[PD treatment PLACEHOLDER] published visitor identity to pixel");
+      } else {
+        console.log("[PD treatment PLACEHOLDER] Shopify.analytics.publish unavailable; pixel will use its sandbox id");
+      }
+    } catch (error) {
+      console.log("[PD treatment PLACEHOLDER] could not publish visitor identity", error);
+    }
   }
 
   var visitorId = getOrCreateVisitorId();
+  publishVisitorIdentity(visitorId);
+
+  var handle = parseCollectionHandle(window.location.pathname);
+  if (!handle) {
+    return; // not a collection page — identity published, nothing else to do
+  }
+
   assign(visitorId, handle).then(function (result) {
     var variant = result && result.variant;
     console.log(

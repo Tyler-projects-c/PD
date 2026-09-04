@@ -13,14 +13,19 @@ import { assignVisitorToExperiment } from "../utils/experiments.server";
  * pixel and direct tests. Payloads are validated and FK-constrained by the
  * events table, so rows can only reference real shops/visitors.
  *
- * Visitor identity: the theme treatment script (extensions/pd-treatment) sets
- * a first-party pd_visitor_id cookie on the shop domain, and the pixel sends
- * events with credentials:"include". When that cookie is present it WINS over
- * the payload's visitor_id — the sandboxed localStorage id is only a fallback
- * for visitors without the cookie. This unification is what links tracked
- * events to the same visitor identity the theme script used to resolve its
- * experiment assignment (the pixel sandbox and the theme cannot see each
- * other's storage).
+ * Visitor identity: arrives EXPLICITLY in the payload's visitor_id. The web
+ * pixel POSTs directly to this app backend (settings.apiUrl), which is a
+ * different origin from the storefront — so browser cookie-attachment rules
+ * mean the shop-domain pd_visitor_id cookie can NEVER reach this route, and
+ * no cookie-based identity is honored here. Instead, the theme treatment
+ * script (extensions/pd-treatment) reads its same-origin cookie and hands the
+ * id to the pixel over Shopify's documented custom-event bridge
+ * (Shopify.analytics.publish("pd:visitor_identified", { visitor_id }) on the
+ * page → analytics.subscribe + event.customData in the pixel); the pixel
+ * stores it in its sandbox localStorage and sends it as the payload
+ * visitor_id. The pixel's own sandbox-generated id is the fallback when the
+ * bridge hasn't fired (e.g. theme script disabled). One identity end to end,
+ * with no reliance on cross-origin cookie behavior.
  */
 
 const CORS_HEADERS: Record<string, string> = {
@@ -46,10 +51,10 @@ const lineItemSchema = z.object({
 
 const payloadSchema = z.object({
   event_type: z.enum(EVENT_TYPES),
-  // Optional in the payload: when the pd_visitor_id cookie is present it
-  // identifies the visitor instead. At least one of the two is required
-  // (enforced after parsing).
-  visitor_id: z.string().uuid().nullish(),
+  // The one and only visitor identity (see module doc): the theme cookie id
+  // bridged into the pixel via the pd:visitor_identified custom event, or the
+  // pixel's sandbox-generated fallback id.
+  visitor_id: z.string().uuid(),
   shop_domain: z.string().min(1).max(255),
   product_id: z.string().min(1).max(255).nullish(),
   order_id: z.string().min(1).max(255).nullish(),
@@ -101,20 +106,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return jsonResponse({ error: "Invalid event payload" }, 400);
   }
 
-  // Identity resolution: the first-party pd_visitor_id cookie (set by the
-  // theme treatment script on the shop domain, forwarded by the pixel's
-  // credentialled fetch) wins; the payload's sandboxed localStorage id is the
-  // fallback. At least one must be present and be a valid UUID.
-  const cookieVisitorId = /(?:^|;\s*)pd_visitor_id=([0-9a-fA-F-]{36})/.exec(
-    request.headers.get("cookie") ?? "",
-  )?.[1];
-  const effectiveVisitorId = cookieVisitorId ?? parsed.data.visitor_id ?? null;
-  if (!effectiveVisitorId || !z.string().uuid().safeParse(effectiveVisitorId).success) {
-    console.warn(
-      "[api.events] rejected payload with no usable visitor identity (no cookie, no valid visitor_id)",
-    );
-    return jsonResponse({ error: "Invalid event payload" }, 400);
-  }
+  // Identity: the payload's visitor_id IS the visitor (already validated as a
+  // UUID by the schema). No cookie fallback — see the module doc for why a
+  // cookie can never legitimately reach this cross-origin route.
+  const effectiveVisitorId = parsed.data.visitor_id;
 
   // Respond immediately — ingestion must stay fast even if the database is
   // slow. Persistence failures are logged server-side instead of being

@@ -7,13 +7,20 @@ import {register} from "@shopify/web-pixels-extension";
 // ingestion endpoint. The endpoint URL is injected through the pixel
 // `settings` (set via the webPixelCreate / webPixelUpdate Admin API mutations).
 //
-// Visitor identity: events are sent with credentials:"include" so the
-// first-party pd_visitor_id cookie on the shop domain (set by the theme
-// treatment script, extensions/pd-treatment) reaches the server, which
-// prefers it over the id below. The sandboxed localStorage id is only a
-// fallback for visitors whose cookie is absent/blocked — this is what links
-// tracked events to the same visitor identity the theme script used to
-// resolve experiment assignments.
+// Visitor identity: the pixel POSTs directly to the app backend
+// (settings.apiUrl) — a DIFFERENT origin from the storefront — so the
+// shop-domain pd_visitor_id cookie can never attach to these requests (cookie
+// attachment follows the request target's domain, and a credentialed request
+// would in any case be rejected by this endpoint's wildcard CORS). Identity is
+// therefore bridged EXPLICITLY: the theme treatment script reads its
+// same-origin cookie and publishes it via Shopify's documented custom-event
+// bridge (Shopify.analytics.publish("pd:visitor_identified", { visitor_id })
+// on the page), which arrives here as event.customData. The bridged id is
+// stored in this sandbox's localStorage (which persists across pages,
+// including checkout pages where the theme script does not run), so every
+// event — collection_viewed through checkout_completed — carries the SAME
+// visitor id the theme used for its experiment assignment. The sandbox
+// localStorage id is the fallback when the bridge hasn't fired.
 
 const VISITOR_ID_KEY = "pd_visitor_id";
 
@@ -55,6 +62,58 @@ function getVisitorId(browser) {
     })();
   }
   return visitorIdPromise;
+}
+
+// Custom event the theme script publishes with the cookie-derived visitor id
+// (Shopify analytics.publish → event.customData here).
+const BRIDGE_EVENT = "pd:visitor_identified";
+// How long events wait for the bridge before falling back to the sandbox id.
+// The theme script publishes during page load (deferred app embed), so this
+// normally resolves in well under a second; checkout pages, where the theme
+// script never runs, always take the full wait and then reuse the id stored
+// by earlier pages.
+const IDENTITY_WAIT_MS = 2000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Identity bridged from the theme on THIS page, plus waiters for events that
+// fired before it arrived.
+let bridgedVisitorId = null;
+const bridgeWaiters = [];
+
+function settleBridgedVisitorId(id) {
+  if (bridgedVisitorId) {
+    return; // first bridge on a page wins; later pages re-settle a fresh copy
+  }
+  bridgedVisitorId = id;
+  while (bridgeWaiters.length) {
+    bridgeWaiters.shift()(id);
+  }
+}
+
+/**
+ * Resolves the visitor id to send: the bridged cookie id if it has arrived
+ * (or arrives within IDENTITY_WAIT_MS), otherwise the sandbox localStorage id
+ * (persisting a fresh one if needed). Never rejects.
+ */
+function resolveVisitorId(browser) {
+  if (bridgedVisitorId) {
+    return Promise.resolve(bridgedVisitorId);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    bridgeWaiters.push((id) => {
+      if (!settled) {
+        settled = true;
+        resolve(id);
+      }
+    });
+    setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        getVisitorId(browser).then(resolve);
+      }
+    }, IDENTITY_WAIT_MS);
+  });
 }
 
 // "gid://shopify/Product/123456" -> "123456"; plain numeric ids pass through.
@@ -102,34 +161,49 @@ register(({analytics, browser, init, settings}) => {
   // Fire-and-forget: never block or break the storefront on tracking
   // failures. keepalive lets the request survive page transitions, which is
   // essential for checkout_completed (thank-you page).
+  //
+  // NOTE: deliberately NO credentials:"include" — this request targets the
+  // app backend, a different origin from the storefront, so the shop-domain
+  // pd_visitor_id cookie never attaches to it (and this endpoint's wildcard
+  // CORS would reject a credentialed request outright). Identity travels in
+  // the payload instead (see resolveVisitorId / BRIDGE_EVENT).
   const sendEvent = (eventType, timestamp, extra = {}) => {
-    getVisitorId(browser)
+    resolveVisitorId(browser)
       .then((visitorId) => {
         console.log(`PD pixel: sending ${eventType} -> ${apiUrl}`);
-        const body = JSON.stringify({
-          event_type: eventType,
-          visitor_id: visitorId,
-          shop_domain: shopDomain,
-          occurred_at: timestamp,
-          ...extra,
-        });
-        // credentials:"include" carries the shop-domain pd_visitor_id cookie
-        // (set by the theme treatment script) so the server can unify visitor
-        // identity across pixel events and experiment assignments. If the
-        // credentialled request is rejected (cookie restrictions, CORS edge
-        // cases), retry once WITHOUT credentials so event delivery never
-        // regresses — the payload's visitor_id is the fallback identity.
         return fetch(apiUrl, {
           method: "POST",
-          body,
+          body: JSON.stringify({
+            event_type: eventType,
+            visitor_id: visitorId,
+            shop_domain: shopDomain,
+            occurred_at: timestamp,
+            ...extra,
+          }),
           keepalive: true,
-          credentials: "include",
-        }).catch(() => fetch(apiUrl, { method: "POST", body, keepalive: true }));
+        });
       })
       .catch((error) => {
         console.log(`PD pixel: failed to send ${eventType}`, error);
       });
   };
+
+  // Identity bridge from the theme (see module doc). The published payload
+  // arrives as event.customData. Persisting it over VISITOR_ID_KEY means
+  // later pages — including checkout pages, where the theme script never runs
+  // — reuse the SAME id via getVisitorId's localStorage read.
+  analytics.subscribe(BRIDGE_EVENT, (event) => {
+    const id = event?.customData?.visitor_id;
+    if (typeof id !== "string" || !UUID_PATTERN.test(id)) {
+      console.log("PD pixel: ignored malformed pd:visitor_identified payload");
+      return;
+    }
+    settleBridgedVisitorId(id);
+    browser.localStorage
+      .setItem(VISITOR_ID_KEY, id)
+      .catch((error) => console.log("PD pixel: could not persist bridged visitor id", error));
+    console.log(`PD pixel: bridged visitor identity from theme`);
+  });
 
   analytics.subscribe("page_viewed", (event) => {
     sendEvent("page_viewed", event.timestamp);
