@@ -25,6 +25,20 @@
  * on the event is compared against `assigned_at` on the assignment row; only
  * checkouts at-or-after the assignment timestamp count toward either arm.
  *
+ * Bounded conversion window: a purchase also stops counting once it falls after
+ * the assignment timestamp PLUS `windowDays` (default 14). The lower bound
+ * protects against backwards causality; the upper bound keeps the metric honest
+ * in the other direction — a purchase weeks or months after assignment is far
+ * more likely to be the shopper's ordinary behaviour than something this
+ * experiment caused, and an unbounded window makes lift drift upward the longer
+ * you wait to compute it. 14 days is a reasonable default because it gives
+ * shoppers realistic time to return to the store after seeing the experiment
+ * surface while still crediting the experiment only for purchases it plausibly
+ * influenced. Callers can override per-call (e.g. `windowDays: 30` for
+ * higher-consideration purchases); the chosen window is returned on every
+ * result so a different number is never mistaken for the experiment having
+ * changed.
+ *
  * This module is deliberately the only place these numbers are derived, so a
  * future dashboard and the verification harness exercise the same logic.
  */
@@ -47,6 +61,8 @@ export interface AttributionResult {
   surface: string;
   surface_ref: string;
   experiment_id: string | null;
+  /** Conversion window (days after assignment) this result was computed under. */
+  windowDays: number;
   computed_at: string;
   control: AttributionGroup;
   treatment: AttributionGroup;
@@ -70,12 +86,21 @@ function pctLift(treatment: number, control: number): number | null {
   return Math.round(((treatment - control) / control) * 10000) / 100;
 }
 
+/** Default conversion window: days after assignment during which a purchase counts. */
+export const DEFAULT_WINDOW_DAYS = 14;
+
+const WINDOW_MS = (days: number) => days * 24 * 60 * 60 * 1000;
+
 export async function computeAttribution(opts: {
   shop_domain: string;
   surface: string;
   surface_ref: string;
+  /** Days after assignment during which a purchase counts (default 14). */
+  windowDays?: number;
 }): Promise<AttributionResult> {
   const { shop_domain, surface, surface_ref } = opts;
+  const windowDays = opts.windowDays ?? DEFAULT_WINDOW_DAYS;
+  const windowMs = WINDOW_MS(windowDays);
 
   // 1. Every assignment for this instance → which arm each visitor is in, plus
   //    that visitor's assigned_at so we can enforce the temporal constraint.
@@ -124,9 +149,14 @@ export async function computeAttribution(opts: {
   for (const ev of checkouts) {
     const arm = armOfVisitor[ev.visitor_id];
     if (!arm) continue; // checkout from a visitor not assigned to this instance
-    if (ev.occurred_at.getTime() < assignedAtOfVisitor[ev.visitor_id].getTime()) {
-      continue; // purchase predates the assignment — not attributable to it
-    }
+    const occurredMs = ev.occurred_at.getTime();
+    const assignedMs = assignedAtOfVisitor[ev.visitor_id].getTime();
+    // Lower bound (existing fix): a purchase before assignment was not
+    // influenced by this experiment. Upper bound (this change, additive): a
+    // purchase after assigned_at + windowDays is outside the conversion window
+    // and must not count for either arm either.
+    if (occurredMs < assignedMs) continue;
+    if (occurredMs > assignedMs + windowMs) continue;
     purchasing[arm].add(ev.visitor_id);
     const amount = Number(ev.revenue);
     if (Number.isFinite(amount)) revenue[arm] += amount;
@@ -151,6 +181,7 @@ export async function computeAttribution(opts: {
     surface,
     surface_ref,
     experiment_id: experimentId,
+    windowDays,
     computed_at: new Date().toISOString(),
     control,
     treatment,
