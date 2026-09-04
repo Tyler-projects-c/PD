@@ -17,6 +17,14 @@
  *     within an instance, and a purchase is never attributed to a different
  *     instance's experiment than the one that actually influenced the visitor.
  *
+ * Temporal constraint: a checkout is attributed to an arm only if it occurred
+ * AT OR AFTER that visitor's `assigned_at` for this exact instance. A purchase
+ * made BEFORE the visitor was ever assigned to this collection/search is not a
+ * conversion this experiment could have influenced — counting it would be
+ * backwards causality that inflates lift for repeat customers. So `occurred_at`
+ * on the event is compared against `assigned_at` on the assignment row; only
+ * checkouts at-or-after the assignment timestamp count toward either arm.
+ *
  * This module is deliberately the only place these numbers are derived, so a
  * future dashboard and the verification harness exercise the same logic.
  */
@@ -69,14 +77,16 @@ export async function computeAttribution(opts: {
 }): Promise<AttributionResult> {
   const { shop_domain, surface, surface_ref } = opts;
 
-  // 1. Every assignment for this instance → which arm each visitor is in.
+  // 1. Every assignment for this instance → which arm each visitor is in, plus
+  //    that visitor's assigned_at so we can enforce the temporal constraint.
   const assignments = await db.experiment_assignments.findMany({
     where: { shop_domain, surface, surface_ref },
-    select: { visitor_id: true, variant: true, experiment_id: true },
+    select: { visitor_id: true, variant: true, experiment_id: true, assigned_at: true },
   });
 
   const visitorsByArm: Record<Arm, Set<string>> = { control: new Set(), treatment: new Set() };
   const armOfVisitor: Record<string, Arm> = {};
+  const assignedAtOfVisitor: Record<string, Date> = {};
   let experimentId: string | null = null;
 
   for (const a of assignments) {
@@ -85,12 +95,14 @@ export async function computeAttribution(opts: {
     visitorsByArm[a.variant].add(a.visitor_id);
     // One assignment per (visitor, surface, surface_ref), so this is exact.
     armOfVisitor[a.visitor_id] = a.variant;
+    assignedAtOfVisitor[a.visitor_id] = a.assigned_at;
   }
 
   const allVisitorIds = [...new Set(assignments.map((a) => a.visitor_id))];
 
   // 2. All purchase events from those visitors. Anchored purely by the visitor:
-  //    the instance scoping already happened in step 1.
+  //    the instance scoping already happened in step 1. occurred_at is pulled
+  //    too so step 3 can enforce the at-or-after-assignment constraint.
   const checkouts = allVisitorIds.length
     ? await db.events.findMany({
         where: {
@@ -98,17 +110,23 @@ export async function computeAttribution(opts: {
           event_type: "checkout_completed",
           visitor_id: { in: allVisitorIds },
         },
-        select: { visitor_id: true, revenue: true },
+        select: { visitor_id: true, revenue: true, occurred_at: true },
       })
     : [];
 
-  // 3. Attribute each checkout to an arm via its visitor's assignment.
+  // 3. Attribute each checkout to an arm via its visitor's assignment. Only a
+  //    checkout that happened AT OR AFTER the visitor's assigned_at counts —
+  //    a purchase made before they were ever assigned to this instance was not
+  //    influenced by it and must not be counted for either arm.
   const purchasing: Record<Arm, Set<string>> = { control: new Set(), treatment: new Set() };
   const revenue: Record<Arm, number> = { control: 0, treatment: 0 };
 
   for (const ev of checkouts) {
     const arm = armOfVisitor[ev.visitor_id];
     if (!arm) continue; // checkout from a visitor not assigned to this instance
+    if (ev.occurred_at.getTime() < assignedAtOfVisitor[ev.visitor_id].getTime()) {
+      continue; // purchase predates the assignment — not attributable to it
+    }
     purchasing[arm].add(ev.visitor_id);
     const amount = Number(ev.revenue);
     if (Number.isFinite(amount)) revenue[arm] += amount;

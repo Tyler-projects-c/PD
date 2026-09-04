@@ -58,10 +58,18 @@ export interface AssignmentResult {
  * existing assignment (stickiness).
  *
  * Stickiness is enforced by the table's composite primary key
- * (visitor_id, surface, surface_ref): the upsert's update branch is empty, so
- * an existing row is returned untouched and its variant is never re-rolled.
- * The PK also makes concurrent first-visits safe — the loser of the race hits
- * the unique constraint and re-reads via the update branch (upsert retries).
+ * (visitor_id, surface, surface_ref): we INSERT with `skipDuplicates: true`, so
+ * an already-existing row is left untouched and its variant is never re-rolled.
+ * The PK also makes concurrent first-visits safe — exactly one call inserts,
+ * the rest skip and read the winner's committed row (see below).
+ *
+ * `newly_assigned` is derived FROM the atomic insert itself, not from a
+ * separate findUnique beforehand. We INSERT with `skipDuplicates: true` (a
+ * single Postgres `INSERT ... ON CONFLICT DO NOTHING`): it returns the count of
+ * rows actually created, so a count of 1 means THIS call performed the insert.
+ * Under concurrency exactly one call gets count 1 — the rest get 0 and fall
+ * through to read the winner's committed, sticky assignment. This is race-free
+ * and, unlike a read-then-write upsert, cannot throw a duplicate-key error.
  *
  * Note the surface_ref scoping: a visitor gets an INDEPENDENT random draw per
  * surface_ref (each collection/search is its own experiment instance), while
@@ -83,17 +91,36 @@ export async function assignVisitorToExperiment(
 
   const variant: "control" | "treatment" = Math.random() < 0.5 ? "control" : "treatment";
 
-  const existing = await db.experiment_assignments.findUnique({
-    where: {
-      visitor_id_surface_surface_ref: {
+  // INSERT ... ON CONFLICT DO NOTHING (atomic): `count` is 1 iff THIS call
+  // created the row. If the row already exists — a repeat visit, or a
+  // concurrent first-visit that won — the insert is a no-op and count is 0.
+  const { count } = await db.experiment_assignments.createMany({
+    data: [
+      {
         visitor_id: visitorId,
+        shop_domain: shopDomain,
         surface,
         surface_ref: surfaceRef,
+        experiment_id: experiment.experiment_id,
+        variant,
       },
-    },
+    ],
+    skipDuplicates: true,
   });
 
-  const row = await db.experiment_assignments.upsert({
+  if (count === 1) {
+    return {
+      variant,
+      experiment_id: experiment.experiment_id,
+      newly_assigned: true,
+    };
+  }
+
+  // We lost the race (or this is a repeat visit): the row already exists with a
+  // committed, sticky variant — return that, never re-rolling. (`count === 0`
+  // above only happens because the ON CONFLICT DO NOTHING absorbed an insert
+  // attempt on this exact PK, so the row is guaranteed to exist.)
+  const row = await db.experiment_assignments.findUnique({
     where: {
       visitor_id_surface_surface_ref: {
         visitor_id: visitorId,
@@ -101,21 +128,16 @@ export async function assignVisitorToExperiment(
         surface_ref: surfaceRef,
       },
     },
-    // Stickiness: never modify an existing assignment.
-    update: {},
-    create: {
-      visitor_id: visitorId,
-      shop_domain: shopDomain,
-      surface,
-      surface_ref: surfaceRef,
-      experiment_id: experiment.experiment_id,
-      variant,
-    },
   });
+  if (!row) {
+    throw new Error(
+      `experiment assignment vanished: ${visitorId}/${surface}/${surfaceRef}`,
+    );
+  }
 
   return {
     variant: row.variant as "control" | "treatment",
     experiment_id: row.experiment_id,
-    newly_assigned: existing === null,
+    newly_assigned: false,
   };
 }
