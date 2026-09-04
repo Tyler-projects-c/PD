@@ -59,6 +59,12 @@ async function handle(request: Request): Promise<Response> {
     await authenticate.public.appProxy(request);
   } catch (error) {
     if (error instanceof Response) {
+      // Diagnostics: log server time + params so intermittent 401s can be
+      // traced (timestamp skew vs. signature canonicalization).
+      console.warn(
+        `[api.proxy.assign] rejected unverified request at ${new Date().toISOString()}:`,
+        new URL(request.url).searchParams.toString(),
+      );
       return Response.json(
         { variant: null, experiment_id: null, error: "invalid_signature" },
         { status: 401 },

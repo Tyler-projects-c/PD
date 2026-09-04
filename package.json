@@ -59,6 +59,7 @@
     "graphql-config": "^5.1.1",
     "playwright": "^1.62.1",
     "prettier": "^3.6.2",
+    "puppeteer-core": "^25.10.0",
     "typescript": "^5.9.3",
     "vite": "^6.3.6"
   },
