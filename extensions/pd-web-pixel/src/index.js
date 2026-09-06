@@ -270,7 +270,7 @@ register(({analytics, browser, init, settings}) => {
       : [];
     if (!productIds.length) return;
     sendEvent("product_impression", event.timestamp, {
-      surface: "collection",
+      surface: typeof data.surface === "string" ? data.surface : "collection",
       surface_ref: typeof data.surface_ref === "string" ? data.surface_ref : null,
       line_items: productIds.map((id) => ({ product_id: String(id).slice(0, 255), revenue: null })),
     });

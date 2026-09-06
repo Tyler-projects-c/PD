@@ -28,9 +28,12 @@
  *      visitor's request. Control visitors and visitors with no active
  *      experiment on the surface get NO redirect: they see the merchant's
  *      default order, untouched.
- *   4. On collection pages, tags visible product cards from the DOM (no theme
- *      edits) and reports real viewport impressions via the same identity
- *      bridge the pixel already uses (Shopify.analytics.publish).
+ *   4. On collection and default search-results pages (/search?q=...), tags
+ *      visible product cards from the DOM (no theme edits) and reports real
+ *      viewport impressions via the same identity bridge the pixel already
+ *      uses (Shopify.analytics.publish). Home, product, and cart pages are
+ *      not impression-tracked. Treatment/control assignment and the sort
+ *      redirect stay collection-only.
  *
  * Failure posture: any error (fetch failed, shop not installed, invalid
  * response) results in NO action — the shopper sees the default order. This
@@ -55,6 +58,41 @@
   function parseCollectionHandle(pathname) {
     var match = COLLECTION_PATH_RE.exec(pathname || "");
     return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  /**
+   * Shopify's default search results URL: /search?q=...
+   * Returns the trimmed, lowercased query, or null when this is not a search
+   * results page / the query is empty. Locale-prefixed paths are not matched.
+   */
+  function parseSearchQuery(pathname, search) {
+    if (!/^\/search\/?$/.test(pathname || "")) {
+      return null;
+    }
+    var query = "";
+    try {
+      query = new URLSearchParams(search || "").get("q") || "";
+    } catch (error) {
+      return null;
+    }
+    query = String(query).trim().toLowerCase();
+    return query ? query : null;
+  }
+
+  /**
+   * Which impression surface this page is, if any. Treatment redirect still
+   * uses parseCollectionHandle alone — do not fold that into this helper.
+   */
+  function resolveSurface(pathname, search) {
+    var collectionHandle = parseCollectionHandle(pathname);
+    if (collectionHandle) {
+      return { surface: "collection", surfaceRef: collectionHandle };
+    }
+    var searchQuery = parseSearchQuery(pathname, search);
+    if (searchQuery) {
+      return { surface: "search", surfaceRef: searchQuery };
+    }
+    return null;
   }
 
   /**
@@ -149,6 +187,8 @@
 
   var PD_TREATMENT_CORE = {
     parseCollectionHandle: parseCollectionHandle,
+    parseSearchQuery: parseSearchQuery,
+    resolveSurface: resolveSurface,
     parseProductHandle: parseProductHandle,
     decideTreatmentRedirect: decideTreatmentRedirect,
     findCardContainer: findCardContainer,
@@ -242,8 +282,10 @@
     }
   }
   /**
-   * Track real product impressions on collection pages, entirely client-side.
-   * No theme-file writes, no Admin API — DOM tagging + IntersectionObserver.
+   * Track real product impressions on collection and search-results pages,
+   * entirely client-side. No theme-file writes, no Admin API — DOM tagging +
+   * IntersectionObserver. Home / product / cart are a no-op (resolveSurface
+   * returns null).
    *
    * Pipeline:
    *   1. Scan <a href> whose pathname ends in /products/{handle}.
@@ -265,8 +307,8 @@
     if (typeof IntersectionObserver === "undefined") {
       return;
     }
-    var collectionHandle = parseCollectionHandle(window.location.pathname);
-    if (!collectionHandle) {
+    var surfaceInfo = resolveSurface(window.location.pathname, window.location.search);
+    if (!surfaceInfo) {
       return;
     }
 
@@ -299,8 +341,8 @@
         var analytics = window.Shopify && window.Shopify.analytics;
         if (analytics && typeof analytics.publish === "function") {
           analytics.publish(IMPRESSION_EVENT, {
-            surface: "collection",
-            surface_ref: collectionHandle,
+            surface: surfaceInfo.surface,
+            surface_ref: surfaceInfo.surfaceRef,
             product_ids: ids,
           });
           console.log(
