@@ -352,8 +352,15 @@ async function main() {
   // Count outbound POSTs to the ingestion endpoint (visible even if the worker
   // console mirroring misses, since POSTs are issued by the worker).
   const apiPath = new URL(apiUrl).pathname;
+  const impressionPosts = [];
   page.on("request", (req) => {
-    if (req.method() === "POST" && req.url().includes(apiPath)) requestCount++;
+    if (req.method() === "POST" && req.url().includes(apiPath)) {
+      requestCount++;
+      try {
+        const body = JSON.parse(req.postData() || "{}");
+        if (body.event_type === "product_impression") impressionPosts.push(body);
+      } catch { /* ignore */ }
+    }
   });
 
   const failures = [];
@@ -361,8 +368,21 @@ async function main() {
     // 1) Home (also handles the password gate up-front).
     await goto(page, "/", "home");
 
-    // 2) A collection.
+    // 2) A collection. Extra settle so impression dwell (400ms) + debounce (800ms) can fire.
     await goto(page, "/collections/all", "collection");
+    await page.waitForTimeout(2000);
+    try {
+      const tagged = await page.evaluate(() =>
+        Array.from(document.querySelectorAll("[data-pd-product-id]")).map((el) => ({
+          id: el.getAttribute("data-pd-product-id"),
+          tag: el.tagName,
+          className: String(el.className || "").slice(0, 60),
+        })),
+      );
+      log(`collection cards tagged: ${tagged.length} ${JSON.stringify(tagged.slice(0, 8))}`);
+    } catch (e) {
+      warn(`could not inspect data-pd-product-id (${e.message.split("\n")[0]})`);
+    }
 
     // 3) A product page. Prefer scraping a real product link from the
     //    collection page so the test survives catalog changes.
@@ -434,6 +454,26 @@ async function main() {
     );
   }
 
+  const impressionRows = await prisma.events.findMany({
+    where: {
+      shop_domain: SHOP,
+      event_type: "product_impression",
+      occurred_at: { gte: new Date(Date.now() - 15 * 60 * 1000) },
+    },
+    select: { product_id: true, surface: true, surface_ref: true, occurred_at: true },
+    orderBy: { occurred_at: "desc" },
+    take: 20,
+  });
+  if (impressionRows.length) {
+    log(
+      `recent product_impression rows: ${impressionRows.length} ` +
+        impressionRows
+          .slice(0, 8)
+          .map((r) => `${r.surface_ref}:${r.product_id}`)
+          .join(", "),
+    );
+  }
+
   const expectedEvents = 3; // minimum meaningful signal (each page fires page_viewed)
   const checks = [
     {
@@ -457,6 +497,15 @@ async function main() {
       name: "pixel worker executed (PD pixel: logs)",
       pass: pixelLogs.length > 0,
       detail: `${pixelLogs.length} log line(s)`,
+    },
+    {
+      name: "product_impression events persisted",
+      pass: impressionRows.length > 0 || impressionPosts.length > 0,
+      detail:
+        `${impressionRows.length} DB row(s) in last 15m, ${impressionPosts.length} POST(s) this run` +
+        (impressionRows[0]
+          ? `; sample surface=${impressionRows[0].surface} ref=${impressionRows[0].surface_ref} product=${impressionRows[0].product_id}`
+          : ""),
     },
   ];
 

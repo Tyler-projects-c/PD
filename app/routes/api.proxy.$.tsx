@@ -70,6 +70,12 @@ async function handle(request: Request): Promise<Response> {
         { status: 401 },
       );
     }
+    // Non-Response errors (DB problems, session lookup failures) surface as
+    // 500s through the proxy — log them here so they are diagnosable.
+    console.error(
+      `[api.proxy.assign] authenticate threw at ${new Date().toISOString()}:`,
+      error instanceof Error ? error.message : error,
+    );
     throw error;
   }
 

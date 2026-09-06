@@ -34,10 +34,21 @@ async function runOnce(browser, index) {
     finalUrl: "",
     redirectedToSortBy: false,
     consoleFlags: {},
+    impressionIds: [],  // product handles published in the pd:product_impressions batch
+    taggedCards: [],
+    pageErrors: [],
+    pdLogs: [],
   };
+
+  page.on("pageerror", (error) => {
+    result.pageErrors.push(error.message);
+  });
 
   page.on("console", (msg) => {
     const text = msg.text();
+    if (text.includes("[PD treatment") || text.includes("PD pixel:")) {
+      result.pdLogs.push(text);
+    }
     if (text.includes("published visitor identity to pixel")) result.consoleFlags.published = true;
     if (text.includes("bridged visitor identity from theme")) result.consoleFlags.bridged = true;
     if (text.includes("PD pixel: sending")) result.consoleFlags.pixelSending = true;
@@ -47,6 +58,11 @@ async function runOnce(browser, index) {
       result.logHandle = handleLine[1];
       result.logVariant = handleLine[2];
       result.logVisitor = handleLine[3];
+    }
+    const impLine = text.match(/published product_impressions: (\d+) \[([^\]]*)\]/);
+    if (impLine) {
+      result.consoleFlags.impressions = true;
+      result.impressionIds = JSON.parse("[" + impLine[2] + "]");
     }
   });
 
@@ -106,15 +122,26 @@ async function runOnce(browser, index) {
     }
   }
   result.embedScript = (await response.text()).includes("pd-treatment.js");
-  await sleep(3500); // identity wait (2s) + possible treatment redirect + follow-up events
+  await sleep(5000); // identity wait + impression dwell (400ms) + debounce (800ms) + possible redirect
 
   result.finalUrl = page.url();
   result.redirectedToSortBy = new URL(result.finalUrl).searchParams.has("sort_by");
+  try {
+    result.taggedCards = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll("[data-pd-product-id]")).map((el) => ({
+        id: el.getAttribute("data-pd-product-id"),
+        tag: el.tagName,
+        className: String(el.className || "").slice(0, 80),
+      }));
+    });
+  } catch {
+    result.taggedCards = [];
+  }
   const cookies = await page.cookies();
   const pdCookie = cookies.find((c) => c.name === "pd_visitor_id");
   result.cookieVisitorId = pdCookie ? pdCookie.value : null;
 
-  console.log(`  [meta] scriptRequested=${result.scriptRequested} scriptStatus=${result.scriptStatus ?? "-"} assignSeen=${result.assignSeen} logVariant=${result.logVariant ?? "-"}`);
+  console.log(`  [meta] tagged=${(result.taggedCards || []).length} impressions=${JSON.stringify(result.impressionIds)} pdImpressionLogs=${JSON.stringify((result.pdLogs || []).filter((l) => /impression/i.test(l)))}`);
   await context.close();
   return result;
 }
@@ -135,7 +162,6 @@ function judge(r) {
     r.assign ? `status ${r.assign.status}, variant=${r.assign.variant}` :
     r.assignBodyLost ? `response body lost to redirect navigation; variant=${variant} from console log (redirect itself implies assignment succeeded)` :
     r.assignError ?? "request never fired");
-  if (!assignOk) return checks;
 
   add("console handle/variant log", !!r.logHandle, `handle=${r.logHandle} variant=${r.logVariant}`);
 
@@ -146,12 +172,25 @@ function judge(r) {
   add("rendering matches arm",
     variant === "treatment" ? r.redirectedToSortBy : !r.redirectedToSortBy,
     `variant=${variant}, redirected=${r.redirectedToSortBy}`);
+
+  // Product impressions (Part 2): the theme script must have published a batch
+  // of seen products on the collection page.
+  add("product impressions fired",
+    !!(r.consoleFlags.impressions && r.impressionIds.length),
+    r.consoleFlags.impressions ? `published ${r.impressionIds.length} renders: [${r.impressionIds.join(", ")}]` : "no pd:product_impressions publish seen");
+  const tagged = r.taggedCards || [];
+  add("product cards tagged in DOM",
+    tagged.length > 0,
+    tagged.length
+      ? tagged.slice(0, 8).map((c) => `${c.tag}.${c.className}->${c.id}`).join(" | ")
+      : "no [data-pd-product-id] nodes");
   return checks;
 }
 
 const browser = await puppeteer.launch({
   executablePath: EDGE,
   headless: "new",
+  defaultViewport: { width: 1280, height: 900 },
   args: ["--no-sandbox", "--disable-dev-shm-usage"],
 });
 

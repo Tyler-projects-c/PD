@@ -258,5 +258,23 @@ register(({analytics, browser, init, settings}) => {
     });
   });
 
+  // Product impressions (Part 2): the theme treatment script scans the
+  // collection grid client-side and publishes the SEEN product handles as a
+  // batch custom event; it arrives here as event.customData. Sent as line_items
+  // (one row per product, no revenue) so a page's whole batch is one request —
+  // same one-row-per-product pattern as checkout line items.
+  analytics.subscribe("pd:product_impressions", (event) => {
+    const data = event?.customData ?? {};
+    const productIds = Array.isArray(data.product_ids)
+      ? data.product_ids.filter((id) => typeof id === "string" && id.length > 0).slice(0, 200)
+      : [];
+    if (!productIds.length) return;
+    sendEvent("product_impression", event.timestamp, {
+      surface: "collection",
+      surface_ref: typeof data.surface_ref === "string" ? data.surface_ref : null,
+      line_items: productIds.map((id) => ({ product_id: String(id).slice(0, 255), revenue: null })),
+    });
+  });
+
   console.log("PD pixel: subscriptions registered");
 });

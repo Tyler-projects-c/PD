@@ -41,6 +41,7 @@ const EVENT_TYPES = [
   "search_submitted",
   "collection_viewed",
   "product_added_to_cart",
+  "product_impression",
   "checkout_completed",
 ] as const;
 
@@ -194,15 +195,15 @@ async function persistEvent(payload: EventPayload, effectiveVisitorId: string) {
   };
 
   const lineItems = payload.line_items ?? [];
-  if (payload.event_type === "checkout_completed" && lineItems.length > 0) {
-    // One row per purchased line item so per-product revenue stays
-    // attributable (matches the product_surface_stats design used by later
-    // phases). The order total is the sum of the line rows.
+  if ((payload.event_type === "checkout_completed" || payload.event_type === "product_impression") && lineItems.length > 0) {
+    // One row per touched product: for checkout that keeps per-product revenue
+    // attributable; for product_impression each row is a shown-product record
+    // (revenue is absent) — the real shown-vs-converted denominator.
     await db.events.createMany({
       data: lineItems.map((lineItem) => ({
         ...baseFields,
         product_id: lineItem.product_id,
-        order_id: payload.order_id ?? null,
+        order_id: payload.event_type === "checkout_completed" ? (payload.order_id ?? null) : null,
         revenue: toDecimal(lineItem.revenue),
       })),
     });
