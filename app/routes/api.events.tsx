@@ -151,6 +151,21 @@ async function ensureVisitor(visitorId: string, shopDomain: string) {
   });
 }
 
+// Prisma maps a PostgreSQL unique-index violation to a specific error shape:
+// an Error with .code === "P2002". Checking the structured .code field keeps
+// this robust across client versions; the fallback also matches when Prisma
+// inlines the code into the message string.
+function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const e = error as { code?: unknown; meta?: unknown };
+  if (e.code === "P2002") return true;
+  if (typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.includes("P2002")) return true;
+  }
+  return false;
+}
+
 async function persistEvent(payload: EventPayload, effectiveVisitorId: string) {
   const occurredAt = parseOccurredAt(payload.occurred_at);
 
@@ -199,14 +214,36 @@ async function persistEvent(payload: EventPayload, effectiveVisitorId: string) {
     // One row per touched product: for checkout that keeps per-product revenue
     // attributable; for product_impression each row is a shown-product record
     // (revenue is absent) — the real shown-vs-converted denominator.
-    await db.events.createMany({
-      data: lineItems.map((lineItem) => ({
-        ...baseFields,
-        product_id: lineItem.product_id,
-        order_id: payload.event_type === "checkout_completed" ? (payload.order_id ?? null) : null,
-        revenue: toDecimal(lineItem.revenue),
-      })),
-    });
+    const rows = lineItems.map((lineItem) => ({
+      ...baseFields,
+      product_id: lineItem.product_id,
+      order_id: payload.event_type === "checkout_completed" ? (payload.order_id ?? null) : null,
+      revenue: toDecimal(lineItem.revenue),
+    }));
+
+    // Checkout idempotency: the events table has a PARTIAL UNIQUE index
+    // (idx_events_checkout_dedup) on (shop_domain, order_id, product_id) for
+    // event_type='checkout_completed', so a retried POST (network retry,
+    // webhook redelivery, double-fire) that reaches the DB a second time is
+    // rejected at the row level with a P2002 unique violation. catch that and
+    // treat it as "already recorded" — but LOG it loudly, because a retry
+    // storm is a signal we want visible, and silently swallowing duplicates is
+    // exactly the FK-swallow failure mode that has bitten this codebase. Any
+    // OTHER error still propagates to the action's catch.
+    try {
+      await db.events.createMany({ data: rows });
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        const dupes = rows.length;
+        console.warn(
+          `[api.events] duplicate checkout_completed POST ignored (idempotent): ` +
+            `shop=${payload.shop_domain} order_id=${payload.order_id ?? "null"} ` +
+            `rows=${dupes} — already recorded by the unique index.`,
+        );
+        return;
+      }
+      throw error;
+    }
     return;
   }
 
