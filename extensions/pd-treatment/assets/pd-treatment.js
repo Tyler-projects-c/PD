@@ -290,8 +290,11 @@
    * Pipeline:
    *   1. Scan <a href> whose pathname ends in /products/{handle}.
    *   2. Walk up to a card ancestor (see findCardContainer) and setAttribute
-   *      data-pd-product-id (numeric data-product-id if the theme already
-   *      exposes one, otherwise the handle).
+   *      data-pd-product-id — the theme's numeric data-product-id when it
+   *      exposes one, otherwise the canonical numeric id resolved by ONE
+   *      batched storefront products.json fetch (handle -> id). Cards that
+   *      cannot be resolved to a numeric id are SKIPPED (loud warn), never
+   *      tagged with the handle string.
    *   3. IntersectionObserver threshold 0.5 + 400ms dwell = the impression.
    *   4. Dedup: at most one impression per product id per page view.
    *   5. Batch via Shopify.analytics.publish("pd:product_impressions") on a
@@ -316,6 +319,13 @@
     var DEBOUNCE_MS = 800;
     var MUTATION_DEBOUNCE_MS = 250;
     var IMPRESSION_EVENT = "pd:product_impressions";
+    // Canonical Shopify product.Json endpoint: one same-origin batched GET per
+    // page that maps handle -> numeric product id. Collection pages use
+    // /collections/{handle}/products.json; search-results pages use
+    // /search.json?q={query}. Removes the per-card network-call fallback and
+    // guarantees impressions record the SAME numeric id the events/products
+    // tables are keyed on.
+    var PRODUCTS_FETCH_LIMIT = 250;
 
     var taggedIds = new Set();
     var pendingDwell = new Set();
@@ -324,7 +334,20 @@
     var queued = [];
     var debounceTimer = null;
 
-    function resolveProductId(card, handle) {
+    // handle -> numeric product id, built by ONE batched storefront fetch.
+    // Empty until the fetch lands; never contains handle strings as values.
+    var handleToId = {};
+    var handleToIdPromise = null;
+    // Cards whose handle was not resolvable from markup when scanned; they wait
+    // for the batched fetch (if one is in flight) before being tagged.
+    var pendingCards = [];
+    // Deduplicate pending entries across re-scans (MutationObserver).
+    var pendingHandles = new Set();
+    // Handles a completed fetch could not map to a numeric id: skip fast and
+    // never re-fetch them every scan.
+    var unResolvableHandles = new Set();
+
+    function resolveNumericIdFromMarkup(card) {
       var direct = card.getAttribute && card.getAttribute("data-product-id");
       if (direct && /^\d+$/.test(direct)) return direct;
       var nested = card.querySelector ? card.querySelector("[data-product-id]") : null;
@@ -332,7 +355,131 @@
         var nestedId = nested.getAttribute("data-product-id");
         if (nestedId && /^\d+$/.test(nestedId)) return nestedId;
       }
-      return handle;
+      return null;
+    }
+
+    /** Batch-resolve handles -> numeric ids from the storefront JSON API (one
+     *  GET for the whole page; cached). Returns the handle->id map, or {} on
+     *  any failure (callers must then skip + warn, never fall back to handle). */
+    function resolveHandleToId(handles) {
+      // The API returns at most PRODUCTS_FETCH_LIMIT per page; issue follow-up
+      // pages only while a full page came back AND we still have handles to find.
+      var unique = Array.from(new Set(handles));
+      var map = {};
+      var url;
+      if (surfaceInfo.surface === "search") {
+        url = "/search.json?q=" + encodeURIComponent(surfaceInfo.surfaceRef);
+      } else {
+        url = "/collections/" + encodeURIComponent(surfaceInfo.surfaceRef) +
+              "/products.json?limit=" + PRODUCTS_FETCH_LIMIT;
+      }
+
+      async function fetchPage(pageIndex) {
+        var sep = url.indexOf("?") >= 0 ? "&" : "?";
+        var pageUrl = url + sep + "page=" + pageIndex;
+        // Storefront JSON is same-origin; no credentials needed.
+        var response = await fetch(pageUrl, { method: "GET" });
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status + " for " + pageUrl);
+        }
+        var body = await response.json();
+        var products = (body && Array.isArray(body.products)) ? body.products : [];
+        for (var i = 0; i < products.length; i++) {
+          var p = products[i];
+          if (p && typeof p.handle === "string" && /^\d+$/.test(String(p.id))) {
+            map[p.handle] = String(p.id);
+          }
+        }
+        return products.length === PRODUCTS_FETCH_LIMIT;
+      }
+
+      async function run() {
+        // "complete" = the fetch covered every product on this surface, so a
+        // missing handle is genuinely unresolvable (not just on an unfetched
+        // page). Early break / page cap / network error all mean incomplete,
+        // and missing handles get a bounded retry instead of a permanent skip.
+        var complete = true;
+        try {
+          var pageIndex = 1;
+          var more = true;
+          while (more && pageIndex <= 5) { // hard cap: 5 * 250 = 1250 products
+            more = await fetchPage(pageIndex);
+            if (!more) break; // natural end of the listing -> complete
+            if (pageIndex === 5) { complete = false; break; } // page cap
+            if (unique.every(function (h) { return map[h] !== undefined; })) {
+              complete = false; // early break: later handles may be on later pages
+              break;
+            }
+            pageIndex++;
+          }
+        } catch (error) {
+          complete = false;
+          console.warn(
+            "[PD treatment PLACEHOLDER] could not fetch product handle->id map from " +
+              url.split("?")[0] + " — " +
+              (error instanceof Error ? error.message : String(error)) +
+              "; unresolved impressions will be SKIPPED (no handle persisted)."
+          );
+        }
+        handleToId = map;
+        handleToIdPromise = null;
+        // Tag any cards that had been waiting on this fetch.
+        flushPendingCards(complete);
+        return map;
+      }
+
+      if (handleToIdPromise) return;
+      handleToIdPromise = run();
+      return handleToIdPromise;
+    }
+
+    // Runs when a batched fetch lands. Tags cards that now have a numeric id.
+    // A handle the fetch could NOT map is either:
+    //   - genuinely unresolvable (fetchComplete) -> warn loudly + remember it
+    //     (unResolvableHandles) so it is never re-fetched, impression skipped;
+    //   - possibly on an unfetched page (!fetchComplete) -> bounded retry
+    //     (max RESOLVE_ATTEMPTS per handle), then treated as unresolvable.
+    // In NO case is a handle string persisted as a product id.
+    var RESOLVE_ATTEMPTS = 2;
+
+    function flushPendingCards(fetchComplete) {
+      var waiting = [];
+      var lost = [];
+      for (var i = 0; i < pendingCards.length; i++) {
+        var entry = pendingCards[i];
+        var id = handleToId[entry.handle];
+        if (id && entry.card) {
+          if (!taggedIds.has(id)) {
+            taggedIds.add(id);
+            entry.card.setAttribute("data-pd-product-id", id);
+            observer.observe(entry.card);
+          }
+          pendingHandles.delete(entry.handle);
+        } else if (id) {
+          // Defensive: a card-less entry (findCardContainer returned null).
+          pendingHandles.delete(entry.handle);
+        } else if (!fetchComplete && (entry.attempts || 0) < RESOLVE_ATTEMPTS) {
+          entry.attempts = (entry.attempts || 0) + 1;
+          waiting.push(entry);
+        } else {
+          lost.push(entry);
+          unResolvableHandles.add(entry.handle);
+          pendingHandles.delete(entry.handle);
+        }
+      }
+      pendingCards = waiting;
+      if (lost.length) {
+        var missing = lost.map(function (e) { return e.handle; }).join(", ");
+        console.warn(
+          "[PD treatment PLACEHOLDER] product ids unresolvable by the storefront " +
+            "handle->id map: " + missing +
+            " — these impressions were NOT recorded (canonical numeric id unknown)."
+        );
+      }
+      if (waiting.length) {
+        // Incomplete fetch: retry just the missing handles once more.
+        resolveHandleToId(waiting.map(function (e) { return e.handle; }));
+      }
     }
 
     function publishBatch(ids) {
@@ -403,16 +550,31 @@
 
     function scanAndObserve() {
       var links = document.querySelectorAll('a[href*="/products/"]');
+      var unresolvedHandles = [];
       for (var i = 0; i < links.length; i++) {
         var link = links[i];
         var handle = parseProductHandle(link.getAttribute("href") || link.href, window.location.href);
         if (!handle) continue;
         var card = findCardContainer(link);
-        var productId = resolveProductId(card, handle);
-        if (taggedIds.has(productId)) continue;
-        taggedIds.add(productId);
-        card.setAttribute("data-pd-product-id", productId);
-        observer.observe(card);
+        // Fast path: the theme already exposes a numeric id in markup.
+        var numeric = resolveNumericIdFromMarkup(card);
+        if (!numeric && handleToId[handle]) numeric = handleToId[handle];
+        if (numeric) {
+          if (taggedIds.has(numeric)) continue;
+          taggedIds.add(numeric);
+          card.setAttribute("data-pd-product-id", numeric);
+          observer.observe(card);
+        } else if (!unResolvableHandles.has(handle) && !pendingHandles.has(handle)) {
+          // No numeric id available yet: defer this card to the batched
+          // handle->id fetch. Never tag with the handle — if the fetch can't
+          // resolve it either, flushPendingCards warns and the card is skipped.
+          pendingHandles.add(handle);
+          pendingCards.push({ card: card, handle: handle });
+          unresolvedHandles.push(handle);
+        }
+      }
+      if (unresolvedHandles.length) {
+        resolveHandleToId(unresolvedHandles);
       }
     }
 
