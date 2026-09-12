@@ -17,6 +17,8 @@
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
     "vite": "vite",
+    "test:thompson": "node --test scripts/test-thompson-sampling.mjs scripts/test-thompson-daily-cache.mjs",
+    "sim:thompson": "node scripts/simulate-thompson.mjs",
     "typecheck": "react-router typegen && tsc --noEmit"
   },
   "type": "module",
