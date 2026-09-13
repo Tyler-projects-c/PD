@@ -1,12 +1,13 @@
 /**
  * ============================================================================
- * PD TREATMENT — PLACEHOLDER (pipeline proof, NOT the real scoring algorithm)
+ * PD TREATMENT — THOMPSON SAMPLING (live scoring wired into the collection
+ * surface; daily cached draw served by /api/proxy/rank)
  * ============================================================================
  * Purpose: prove the experiment pipeline end to end — assignment (Prompt 1
  * logic, unchanged) -> different rendering -> different behaviour -> a
- * measurable difference in the attribution query (Prompt 2). This is NOT the
- * real Bayesian/Thompson ranking; it will be replaced wholesale by the real
- * scoring algorithm once the plumbing is proven.
+ * measurable difference in the attribution query (Prompt 2). The scoring is
+ * now the real Thompson Sampling ranking (app/utils/thompson-sampling.ts),
+ * drawn once per visitor/surface/UTC-day and applied client-side.
  *
  * What it does, on every page (app embed block, see blocks/pd_treatment_embed.liquid):
  *   1. Ensures a first-party visitor identity cookie (pd_visitor_id) exists on
@@ -21,19 +22,19 @@
  *      for that collection. This uses the SAME assignVisitorToExperiment()
  *      logic as event tracking — no new assignment mechanism, and the sticky
  *      per-(visitor, surface, surface_ref) draw is shared by both sides.
- *   3. If (and only if) the visitor is in the treatment arm, redirects to the
- *      same URL with ?sort_by=created-descending — Shopify's native per-request
- *      sort override ("most recently created product first"). It does NOT
+ *   3. If (and only if) the visitor is in the treatment arm, fetches the
+ *      day's Thompson ranking (/apps/pd/rank -> app /api/proxy/rank) and
+ *      re-orders the collection grid client-side to match it. It does NOT
  *      change the collection's saved default order and affects only this
- *      visitor's request. Control visitors and visitors with no active
- *      experiment on the surface get NO redirect: they see the merchant's
+ *      visitor's view. Control visitors and visitors with no active
+ *      experiment on the surface get NO reordering: they see the merchant's
  *      default order, untouched.
  *   4. On collection and default search-results pages (/search?q=...), tags
  *      visible product cards from the DOM (no theme edits) and reports real
  *      viewport impressions via the same identity bridge the pixel already
  *      uses (Shopify.analytics.publish). Home, product, and cart pages are
- *      not impression-tracked. Treatment/control assignment and the sort
- *      redirect stay collection-only.
+ *      not impression-tracked. Treatment/control assignment and the ranking
+ *      application stay collection-only.
  *
  * Failure posture: any error (fetch failed, shop not installed, invalid
  * response) results in NO action — the shopper sees the default order. This
@@ -43,15 +44,18 @@
   "use strict";
 
   var COLLECTION_PATH_RE = /\/collections\/([^\/?#]+)/;
-  var TREATMENT_SORT_VALUE = "created-descending";
   var COOKIE_NAME = "pd_visitor_id";
   var COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365; // 1 year
   var ASSIGN_PATH = "/apps/pd/assign"; // app proxy -> /api/proxy/assign
+  var RANK_PATH = "/apps/pd/rank"; // app proxy -> /api/proxy/rank
+  // Bounded wait for the shared handle->id map (below) before applying the
+  // ranking; on timeout we apply with whatever ids resolved by then.
+  var RANK_ID_MAP_TIMEOUT_MS = 3000;
   // Custom event consumed by the web pixel (extensions/pd-web-pixel). Must
   // stay in sync with BRIDGE_EVENT there.
   var BRIDGE_EVENT = "pd:visitor_identified";
-  // Set by trackProductImpressions() so a treatment redirect can flush the
-  // impression batch before navigating away.
+  // Set by trackProductImpressions(); flushed on pagehide /
+  // visibilitychange=hidden so dwell before navigation is never lost.
   var impressionFlushNow = null;
 
   /** "/collections/frontpage?..." -> "frontpage"; null when not a collection page. */
@@ -80,7 +84,7 @@
   }
 
   /**
-   * Which impression surface this page is, if any. Treatment redirect still
+   * Which impression surface this page is, if any. Ranking application still
    * uses parseCollectionHandle alone — do not fold that into this helper.
    */
   function resolveSurface(pathname, search) {
@@ -97,24 +101,20 @@
 
   /**
    * Pure decision function (also exercised by the Node verification harness):
-   * returns the redirect URL for a treatment visitor on an as-yet-unsorted
-   * collection page, or null to leave the page (default order) alone.
+   * true when the Thompson Sampling ranking should be applied for this page
+   * view — treatment-arm visitor on a collection page with NO explicit
+   * sort_by. (The placeholder's sort redirect is gone, so a sort_by present
+   * now always means the shopper picked it — never fight it.)
    */
-  function decideTreatmentRedirect(variant, locationLike) {
+  function shouldApplyRanking(variant, locationLike) {
     if (variant !== "treatment") {
-      return null; // control / null (no active experiment) -> default order
+      return false; // control / null (no active experiment) -> default order
     }
     if (!parseCollectionHandle(locationLike.pathname)) {
-      return null; // not a collection page
+      return false; // not a collection page
     }
     var url = new URL(locationLike.href);
-    if (url.searchParams.has("sort_by")) {
-      // Already explicitly sorted (our own redirect, or the shopper picked a
-      // sort themselves) — never fight it, and this is what prevents loops.
-      return null;
-    }
-    url.searchParams.set("sort_by", TREATMENT_SORT_VALUE);
-    return url.toString();
+    return !url.searchParams.has("sort_by");
   }
 
   /**
@@ -190,9 +190,9 @@
     parseSearchQuery: parseSearchQuery,
     resolveSurface: resolveSurface,
     parseProductHandle: parseProductHandle,
-    decideTreatmentRedirect: decideTreatmentRedirect,
+    shouldApplyRanking: shouldApplyRanking,
     findCardContainer: findCardContainer,
-    TREATMENT_SORT_VALUE: TREATMENT_SORT_VALUE,
+    RANK_PATH: RANK_PATH,
   };
 
   // Node verification harness: expose the pure core without running DOM code.
@@ -209,6 +209,28 @@
       var random = (Math.random() * 16) | 0;
       return (char === "x" ? random : (random & 0x3) | 0x8).toString(16);
     });
+  }
+
+  // Shared with trackProductImpressions(): the batched handle->numeric-id map
+  // (ONE same-origin storefront fetch per page) plus a promise resolved when
+  // it lands. The ranking applier waits on it (bounded) so card->product
+  // mapping uses the SAME canonical numeric ids the impressions and the
+  // product_surface_stats rollup are keyed on — never handle strings.
+  var handleIdMap = {};
+  var handleIdMapReadyResolve = null;
+  var handleIdMapReady = new Promise(function (resolve) {
+    handleIdMapReadyResolve = resolve;
+  });
+
+  function whenHandleIdMapReady(timeoutMs) {
+    return Promise.race([
+      handleIdMapReady,
+      new Promise(function (resolve) {
+        setTimeout(function () {
+          resolve(handleIdMap);
+        }, timeoutMs);
+      }),
+    ]);
   }
 
   function readVisitorCookie() {
@@ -228,7 +250,7 @@
     try {
       existing = readVisitorCookie();
     } catch (error) {
-      console.log("[PD treatment PLACEHOLDER] could not read visitor cookie", error);
+      console.log("[PD treatment] could not read visitor cookie", error);
     }
     if (existing) {
       return existing;
@@ -237,7 +259,7 @@
     try {
       writeVisitorCookie(created);
     } catch (error) {
-      console.log("[PD treatment PLACEHOLDER] could not persist visitor cookie", error);
+      console.log("[PD treatment] could not persist visitor cookie", error);
     }
     return created;
   }
@@ -257,9 +279,110 @@
         return response.ok ? response.json() : null;
       })
       .catch(function (error) {
-        console.log("[PD treatment PLACEHOLDER] assignment request failed; leaving default order", error);
+        console.log("[PD treatment] assignment request failed; leaving default order", error);
         return null;
       });
+  }
+
+  /**
+   * Fetch the day's Thompson ranking for this visitor+collection from the
+   * app proxy (same-origin; Shopify signs the request server-side). Resolves
+   * { ranking, drew, date_utc } or null on any failure — null means "keep
+   * the default order".
+   */
+  function fetchDailyRanking(visitorId, handle) {
+    var params = new URLSearchParams({
+      visitor_id: visitorId,
+      surface: "collection",
+      surface_ref: handle,
+    });
+    var shopDomain = (window.Shopify && window.Shopify.shop) || "";
+    if (shopDomain) {
+      params.set("shop", shopDomain); // fallback; the proxy also signs `shop`
+    }
+    return fetch(RANK_PATH + "?" + params.toString(), { method: "GET" })
+      .then(function (response) {
+        return response.ok ? response.json() : null;
+      })
+      .catch(function (error) {
+        console.log("[PD treatment] ranking request failed; leaving default order", error);
+        return null;
+      });
+  }
+
+  /**
+   * Canonical numeric product id for a card: the impression tracker's tag,
+   * else the theme's own data-product-id markup, else the shared batched
+   * handle->id map. Null when unresolvable — such cards are NEVER reordered
+   * (they keep their default position; no handle strings as ids).
+   */
+  function cardNumericId(card, handle, idMap) {
+    var tagged = card.getAttribute && card.getAttribute("data-pd-product-id");
+    if (tagged && /^\d+$/.test(tagged)) return tagged;
+    var nested = card.querySelector ? card.querySelector("[data-product-id]") : null;
+    if (nested) {
+      var markupId = nested.getAttribute("data-product-id");
+      if (markupId && /^\d+$/.test(markupId)) return markupId;
+    }
+    var mapped = idMap[handle];
+    return mapped && /^\d+$/.test(mapped) ? mapped : null;
+  }
+
+  /**
+   * Apply a ranked product_id order to the collection grid. Reorders only
+   * cards sharing the reference card's grid parent (never pulls cards across
+   * sections). Cards whose id is unresolvable or absent from the ranking
+   * keep their default relative position after the ranked block.
+   * Returns the number of cards moved (0 = grid untouched).
+   */
+  function applyRankingToGrid(ranking, idMap) {
+    if (!Array.isArray(ranking) || ranking.length === 0) return 0;
+    var anchors = document.querySelectorAll("a[href]");
+    var seenCards = new Set();
+    var entries = []; // { card, id } in DOM order
+    for (var i = 0; i < anchors.length; i++) {
+      var handle = parseProductHandle(anchors[i].getAttribute("href"));
+      if (!handle) continue;
+      var card = findCardContainer(anchors[i]);
+      if (!card || seenCards.has(card)) continue;
+      var id = cardNumericId(card, handle, idMap || {});
+      if (!id) continue;
+      seenCards.add(card);
+      entries.push({ card: card, id: id });
+    }
+    if (entries.length < 2) return 0;
+
+    var rankIndex = {};
+    for (var r = 0; r < ranking.length; r++) {
+      var pid = String(ranking[r]);
+      if (!(pid in rankIndex)) rankIndex[pid] = r;
+    }
+
+    var parent = entries[0].card.parentElement;
+    if (!parent) return 0;
+    var ranked = entries
+      .filter(function (e) {
+        return e.card.parentElement === parent && e.id in rankIndex;
+      })
+      .sort(function (a, b) {
+        return rankIndex[a.id] - rankIndex[b.id];
+      });
+    if (ranked.length < 2) return 0;
+
+    // Insertion anchor: the first grid child AFTER the ranked block's
+    // original position that is not itself ranked (null => append at end).
+    var rankedSet = new Set(ranked.map(function (e) { return e.card; }));
+    var anchor = ranked[0].card.nextSibling;
+    while (anchor && rankedSet.has(anchor)) {
+      anchor = anchor.nextSibling;
+    }
+
+    var frag = document.createDocumentFragment();
+    for (var k = 0; k < ranked.length; k++) {
+      frag.appendChild(ranked[k].card);
+    }
+    parent.insertBefore(frag, anchor);
+    return ranked.length;
   }
 
   /**
@@ -273,12 +396,12 @@
       var analytics = window.Shopify && window.Shopify.analytics;
       if (analytics && typeof analytics.publish === "function") {
         analytics.publish(BRIDGE_EVENT, { visitor_id: visitorId });
-        console.log("[PD treatment PLACEHOLDER] published visitor identity to pixel");
+        console.log("[PD treatment] published visitor identity to pixel");
       } else {
-        console.log("[PD treatment PLACEHOLDER] Shopify.analytics.publish unavailable; pixel will use its sandbox id");
+        console.log("[PD treatment] Shopify.analytics.publish unavailable; pixel will use its sandbox id");
       }
     } catch (error) {
-      console.log("[PD treatment PLACEHOLDER] could not publish visitor identity", error);
+      console.log("[PD treatment] could not publish visitor identity", error);
     }
   }
   /**
@@ -415,13 +538,18 @@
         } catch (error) {
           complete = false;
           console.warn(
-            "[PD treatment PLACEHOLDER] could not fetch product handle->id map from " +
+            "[PD treatment] could not fetch product handle->id map from " +
               url.split("?")[0] + " — " +
               (error instanceof Error ? error.message : String(error)) +
               "; unresolved impressions will be SKIPPED (no handle persisted)."
           );
         }
         handleToId = map;
+        handleIdMap = map;
+        if (handleIdMapReadyResolve) {
+          handleIdMapReadyResolve(map);
+          handleIdMapReadyResolve = null;
+        }
         handleToIdPromise = null;
         // Tag any cards that had been waiting on this fetch.
         flushPendingCards(complete);
@@ -471,7 +599,7 @@
       if (lost.length) {
         var missing = lost.map(function (e) { return e.handle; }).join(", ");
         console.warn(
-          "[PD treatment PLACEHOLDER] product ids unresolvable by the storefront " +
+          "[PD treatment] product ids unresolvable by the storefront " +
             "handle->id map: " + missing +
             " — these impressions were NOT recorded (canonical numeric id unknown)."
         );
@@ -493,12 +621,12 @@
             product_ids: ids,
           });
           console.log(
-            "[PD treatment PLACEHOLDER] published product_impressions: " +
+            "[PD treatment] published product_impressions: " +
               ids.length + " " + JSON.stringify(ids)
           );
         }
       } catch (error) {
-        console.log("[PD treatment PLACEHOLDER] could not publish product_impressions", error);
+        console.log("[PD treatment] could not publish product_impressions", error);
       }
     }
 
@@ -611,7 +739,7 @@
   try {
     trackProductImpressions();
   } catch (error) {
-    console.log("[PD treatment PLACEHOLDER] impression tracking failed; continuing", error);
+    console.log("[PD treatment] impression tracking failed; continuing", error);
   }
 
   var handle = parseCollectionHandle(window.location.pathname);
@@ -622,20 +750,33 @@
   assign(visitorId, handle).then(function (result) {
     var variant = result && result.variant;
     console.log(
-      "[PD treatment PLACEHOLDER] handle=" + handle + " variant=" + (variant || "none") +
+      "[PD treatment] handle=" + handle + " variant=" + (variant || "none") +
       " visitor=" + visitorId
     );
-    var redirectUrl = decideTreatmentRedirect(variant, window.location);
-    if (redirectUrl) {
-      // Flush any impressions already dwelled before navigating away, so a
-      // treatment visitor's first view still records seen products.
-      try {
-        if (impressionFlushNow) impressionFlushNow();
-      } catch (error) {
-        console.log("[PD treatment PLACEHOLDER] flush before redirect failed", error);
-      }
-      console.log("[PD treatment PLACEHOLDER] redirecting to " + redirectUrl);
-      window.location.replace(redirectUrl);
+    if (!shouldApplyRanking(variant, window.location)) {
+      return; // control / no experiment / shopper-picked sort -> default order
     }
+    // Thompson Sampling treatment (replaces the placeholder sort redirect):
+    // fetch the day's cached/drawn ranking for this visitor+collection and
+    // re-order the grid client-side. Any failure keeps the default order.
+    fetchDailyRanking(visitorId, handle)
+      .then(function (payload) {
+        var ranking = payload && Array.isArray(payload.ranking) ? payload.ranking : null;
+        if (!ranking || ranking.length === 0) {
+          console.log("[PD treatment] no ranking; leaving default order");
+          return null;
+        }
+        return whenHandleIdMapReady(RANK_ID_MAP_TIMEOUT_MS).then(function (map) {
+          var moved = applyRankingToGrid(ranking, map);
+          console.log(
+            "[PD treatment] Thompson ranking applied: " + moved + " cards" +
+            " (date_utc=" + (payload && payload.date_utc ? payload.date_utc : "?") +
+            (payload && payload.drew ? ", fresh draw" : ", cached") + ")"
+          );
+        });
+      })
+      .catch(function (error) {
+        console.log("[PD treatment] ranking application failed; leaving default order", error);
+      });
   });
 })();

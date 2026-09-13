@@ -1,22 +1,22 @@
 {%- comment -%}
   ============================================================================
-  PD TREATMENT — PLACEHOLDER (pipeline proof, NOT the real scoring algorithm)
+  PD TREATMENT — THOMPSON SAMPLING (real scoring, wired live)
   ============================================================================
   App embed block: injects assets/pd-treatment.js on every storefront page.
   The script asks /apps/pd/assign (the app proxy) which arm
   (control/treatment) the visitor is in for the collection they're viewing
   (using the SAME assignment logic as event tracking — see
-  app/utils/experiments.server.ts) and, for treatment visitors only, reorders
-  the collection grid by redirecting to the same URL with
-  ?sort_by=created-descending (Shopify's native per-request sort override —
-  it does NOT change the collection's saved default order).
+  app/utils/experiments.server.ts) and, for treatment visitors only, fetches
+  the day's Thompson Sampling ranking from /apps/pd/rank and reorders the
+  collection grid client-side (daily cached draw — it does NOT change the
+  collection's saved default order; control visitors are untouched).
 
-  Everything here is deliberately trivial and easy to revert: delete this
-  extension (or disable the "PD treatment (placeholder)" app embed in the
-  theme editor) and every visitor sees the merchant's default order again.
+  Everything stays easy to revert: delete this extension (or disable the
+  "PD treatment (Thompson)" app embed in the theme editor) and every
+  visitor sees the merchant's default order again.
 
   NOTE: the merchant must enable this block once via Theme editor →
-  App embeds → "PD treatment (placeholder)". Until then the script is not
+  App embeds → "PD treatment (Thompson)". Until then the script is not
   loaded and all visitors see the default order.
 {%- endcomment -%}
 
@@ -24,7 +24,7 @@
 
 {% schema %}
 {
-  "name": "PD treatment placeholder",
+  "name": "PD treatment (Thompson)",
   "target": "body",
   "settings": []
 }

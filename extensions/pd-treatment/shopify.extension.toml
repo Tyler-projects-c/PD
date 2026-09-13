@@ -1,7 +1,7 @@
-# PD theme app extension (placeholder treatment rendering).
+# PD theme app extension (Thompson Sampling treatment rendering).
 # Reference: https://shopify.dev/docs/apps/build/online-store/theme-app-extensions
 type = "theme"
 name = "pd-treatment"
 handle = "pd-treatment"
-description = "PD experiment pipeline proof: renders the PLACEHOLDER treatment (newest-first collection sort) for treatment-arm visitors"
+description = "PD merchandising: applies the daily Thompson Sampling collection ranking for treatment-arm visitors (control visitors see the default order)"
 uid = "80e13489-fc80-6649-7de0-3ceedb97798ced8ecfa6"

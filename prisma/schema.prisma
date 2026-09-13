@@ -73,6 +73,27 @@ model product_surface_stats {
   shops        shops    @relation(fields: [shop_domain], references: [shop_domain], onDelete: Cascade, onUpdate: NoAction)
 
   @@id([product_id, shop_domain, surface, surface_ref])
+  @@index([shop_domain, surface, surface_ref], map: "idx_stats_shop_surface")
+}
+
+/// Durable backing for the Thompson daily-resample ranking cache
+/// (app/utils/thompson-daily-cache.ts). One row per (visitor, surface, ref, UTC
+/// day) holding the draw result — same grain as the key built by
+/// buildDailyCacheKey + date_utc. Deleted with its shop on GDPR redact.
+/// This table contains check constraints and requires additional setup for migrations.
+model thompson_daily_rankings {
+  visitor_id  String   @db.Uuid
+  shop_domain String
+  surface     String
+  surface_ref String
+  date_utc    String   @db.VarChar(10)
+  ranking     String[]
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  shops       shops    @relation(fields: [shop_domain], references: [shop_domain], onDelete: Cascade, onUpdate: NoAction)
+  visitors    visitors @relation(fields: [visitor_id], references: [visitor_id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([visitor_id, shop_domain, surface, surface_ref, date_utc])
+  @@index([shop_domain, surface, surface_ref], map: "idx_daily_rankings_surface")
 }
 
 model products {
@@ -104,6 +125,7 @@ model shops {
   experiment_assignments experiment_assignments[]
   product_surface_stats  product_surface_stats[]
   products               products[]
+  thompson_daily_rankings thompson_daily_rankings[]
   visitors               visitors[]
 }
 
@@ -113,6 +135,7 @@ model visitors {
   first_seen_at          DateTime                 @default(now()) @db.Timestamptz(6)
   events                 events[]
   experiment_assignments experiment_assignments[]
+  thompson_daily_rankings thompson_daily_rankings[]
   shops                  shops                    @relation(fields: [shop_domain], references: [shop_domain], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([shop_domain], map: "idx_visitors_shop")

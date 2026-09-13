@@ -3,6 +3,8 @@ import { z } from "zod";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
 import { assignVisitorToExperiment } from "../utils/experiments.server";
+import { ensureSurfaceStatsFresh } from "../utils/product-surface-stats.server";
+import { drawOrReuseDailyRanking } from "../utils/thompson-ranking.server";
 
 /**
  * Storefront-facing experiment assignment endpoint (placeholder treatment phase).
@@ -16,6 +18,13 @@ import { assignVisitorToExperiment } from "../utils/experiments.server";
  * assignVisitorToExperiment() from Prompt 1 (sticky 50/50 split keyed on
  * (visitor_id, surface, surface_ref)) — so the rendering decision and the
  * tracking events resolve to the identical experiment instance.
+ *
+ * A second subpath, {shop}/apps/pd/rank → /api/proxy/rank (handleRank below),
+ * serves the daily Thompson Sampling ranking for one surface instance. It
+ * piggybacks the once-per-UTC-day product_surface_stats rollup on the first
+ * ranking request of the day (this app has no standalone cron/job service —
+ * verified — so the lazy piggyback IS the cadence), then draws or reuses the
+ * visitor's cached daily ranking. Both subpaths share the signature gate.
  *
  * GET (theme script / app proxy) or POST (direct tests) with:
  *   visitor_id, surface ("collection" | "search"), surface_ref, and either
@@ -49,6 +58,65 @@ const requestSchema = z.object({
   surface_ref: z.string().min(1).max(255),
 });
 
+/**
+ * GET /api/proxy/rank — daily Thompson Sampling ranking for one
+ * (visitor_id, surface, surface_ref) instance. Runs AFTER the same proxy
+ * signature gate as assign (called from handle() on the "rank" subpath).
+ *
+ * Cadence (locked decision #3): the daily product_surface_stats rollup is
+ * piggybacked onto the first ranking request of a new UTC day per instance —
+ * ensureSurfaceStatsFresh() no-ops when today's snapshot already exists.
+ *
+ * Returns { ranking: string[], drew: boolean, date_utc }. On any failure
+ * ranking is [] — the theme script treats that as "keep the default order".
+ */
+async function handleRank(request: Request, url: URL): Promise<Response> {
+  const visitorId = url.searchParams.get("visitor_id") ?? "";
+  // Signed `shop` query param wins; the proxy's header is the fallback —
+  // same identity resolution as the assign branch below.
+  const shopDomain =
+    url.searchParams.get("shop") ??
+    request.headers.get("x-shopify-shop-domain") ??
+    "";
+  const surface = url.searchParams.get("surface") ?? "collection";
+  const surfaceRef = url.searchParams.get("surface_ref") ?? "";
+
+  if (!visitorId || !shopDomain || !surfaceRef) {
+    return Response.json({ ranking: [], error: "invalid_request" }, { status: 400 });
+  }
+
+  try {
+    const refreshed = await ensureSurfaceStatsFresh({
+      shop_domain: shopDomain,
+      surface,
+      surface_ref: surfaceRef,
+    });
+    if (refreshed) {
+      console.log(
+        `[api.proxy.rank] product_surface_stats refreshed for ${shopDomain}/${surface}/${surfaceRef}`,
+      );
+    }
+
+    const result = await drawOrReuseDailyRanking({
+      visitor_id: visitorId,
+      shop_domain: shopDomain,
+      surface,
+      surface_ref: surfaceRef,
+    });
+    return Response.json({
+      ranking: result.ranking,
+      drew: result.drew,
+      date_utc: result.date_utc,
+    });
+  } catch (error) {
+    console.error(
+      "[api.proxy.rank] ranking failed (returning no ranking):",
+      error instanceof Error ? error.message : error,
+    );
+    return Response.json({ ranking: [], error: "ranking_failed" });
+  }
+}
+
 async function handle(request: Request): Promise<Response> {
   // Gate EVERYTHING behind proxy signature verification. The library throws a
   // bare Response (400) when the signature is missing/invalid/stale; we
@@ -80,6 +148,15 @@ async function handle(request: Request): Promise<Response> {
   }
 
   const url = new URL(request.url);
+
+  // Subpath routing under the splat: /api/proxy/assign (below) vs
+  // /api/proxy/rank (daily Thompson ranking draw). Both share the signature
+  // gate above; see the module doc for the trust boundary.
+  const subpath = url.pathname.replace(/\/+$/, "").split("/").pop() ?? "";
+  if (subpath === "rank") {
+    return handleRank(request, url);
+  }
+
   const raw: Record<string, unknown> = {};
   url.searchParams.forEach((value, key) => {
     raw[key] = value;

@@ -16,10 +16,10 @@ const TOPIC = "shop/redact";
  *
  * We must erase ALL data PD holds for that shop. We delete every row tied to
  * shop_domain across every table in a SINGLE transaction (atomic): events,
- * experiment_assignments, product_surface_stats, products, visitors,
- * compliance_requests, and the shops row itself. If the shop has no data (or
- * was never installed), the deletes are no-ops and we still return success —
- * "nothing to redact" is a valid outcome.
+ * experiment_assignments, product_surface_stats, thompson_daily_rankings,
+ * products, visitors, compliance_requests, and the shops row itself. If the
+ * shop has no data (or was never installed), the deletes are no-ops and we
+ * still return success — "nothing to redact" is a valid outcome.
  *
  * The request receipt itself is recorded in compliance_requests BEFORE the
  * data wipe in the same transaction, so the audit record is atomic with the
@@ -52,6 +52,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const events = await tx.events.deleteMany({ where: { shop_domain: shop } });
       const assignments = await tx.experiment_assignments.deleteMany({ where: { shop_domain: shop } });
       const stats = await tx.product_surface_stats.deleteMany({ where: { shop_domain: shop } });
+      const rankings = await tx.thompson_daily_rankings.deleteMany({ where: { shop_domain: shop } });
       const products = await tx.products.deleteMany({ where: { shop_domain: shop } });
       const visitors = await tx.visitors.deleteMany({ where: { shop_domain: shop } });
       const compliance = await tx.compliance_requests.deleteMany({
@@ -63,7 +64,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       await tx.compliance_requests.update({
         where: { request_id: auditId },
         data: {
-          action_taken: `shop/redact complete. Deleted: events=${events.count}, assignments=${assignments.count}, stats=${stats.count}, products=${products.count}, visitors=${visitors.count}, compliance_requests=${compliance.count}, shops=${shops.count}.`,
+          action_taken: `shop/redact complete. Deleted: events=${events.count}, assignments=${assignments.count}, stats=${stats.count}, rankings=${rankings.count}, products=${products.count}, visitors=${visitors.count}, compliance_requests=${compliance.count}, shops=${shops.count}.`,
         },
       });
 
@@ -71,6 +72,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         events: events.count,
         assignments: assignments.count,
         stats: stats.count,
+        rankings: rankings.count,
         products: products.count,
         visitors: visitors.count,
         compliance: compliance.count,

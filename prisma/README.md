@@ -46,6 +46,7 @@ migration + this file together if they change**:
 - `experiment_assignments.surface`: `search` \| `collection`
 - `experiment_assignments.variant`: `control` \| `treatment`
 - `product_surface_stats.surface`: `search` \| `collection`
+- `thompson_daily_rankings.surface`: `search` \| `collection`
 
 ## Environment / connections
 

@@ -19,6 +19,7 @@
     "vite": "vite",
     "test:thompson": "node --test scripts/test-thompson-sampling.mjs scripts/test-thompson-daily-cache.mjs",
     "sim:thompson": "node scripts/simulate-thompson.mjs",
+    "verify:thompson-e2e": "node scripts/verify-thompson-e2e.mjs",
     "typecheck": "react-router typegen && tsc --noEmit"
   },
   "type": "module",

@@ -1,0 +1,148 @@
+/**
+ * Live Thompson ranking wiring (server side).
+ *
+ * Consumes the two pure modules (thompson-sampling.ts and thompson-daily-cache.ts)
+ * WITHOUT modifying them. Responsibilities:
+ *
+ * 1. CANDIDATE SET (locked #4): every product in the `products` table for the
+ *    shop is a candidate. product_surface_stats rows (written by the daily
+ *    rollup in product-surface-stats.server.ts) enrich candidates with their
+ *    impressions/purchases; products WITHOUT a stats row still participate as
+ *    zero-history candidates {impressions: 0, conversions: 0} so the
+ *    uninformative prior protects/explores them rather than excluding them.
+ *
+ * 2. DAILY RANKING (locked #5): draw once per (visitor_id, surface, surface_ref)
+ *    per UTC calendar day via getOrDrawDailyRanking, backed by a DURABLE store
+ *    (the thompson_daily_rankings table) so a repeat request on the same day
+ *    returns the identical cached order. The first request of the day calls
+ *    getOrDrawDailyRanking, which invokes the provided draw callback
+ *    (rankByThompsonSampling over the candidates).
+ *
+ * The store interface of thompson-daily-cache.ts is synchronous
+ * (get/set on a Map-like). A live route cannot hold a DB connection inside a
+ * synchronous get/set, so this module loads today's row into a Map, runs
+ * getOrDrawDailyRanking synchronously, then persists any freshly drawn entry
+ * back to Postgres. The cache-table row mirrors the buildDailyCacheKey grain
+ * as separate columns (visitor_id, shop_domain, surface, surface_ref, date_utc).
+ */
+
+import db from "../db.server";
+import { rankByThompsonSampling } from "./thompson-sampling";
+import {
+  getOrDrawDailyRanking,
+  utcDateString,
+  type DailyRankingStore,
+} from "./thompson-daily-cache";
+
+/**
+ * Draw (or reuse) the day's ranked product order for one visitor on one
+ * instance. `refreshStats`'s job is already done by the caller (the rank
+ * route calls ensureSurfaceStatsFresh first); this function only reads.
+ *
+ * Returns the ranked product_ids for the day, plus `drew` (true when THIS call
+ * produced the fresh draw).
+ */
+export async function drawOrReuseDailyRanking(opts: {
+  visitor_id: string;
+  shop_domain: string;
+  surface: string;
+  surface_ref: string;
+  date_utc?: string;
+}): Promise<{ ranking: string[]; drew: boolean; date_utc: string }> {
+  const { visitor_id, shop_domain, surface, surface_ref } = opts;
+  const dateUtc = opts.date_utc ?? utcDateString(new Date());
+
+  // Durable store: load today's row (if any) into a Map so the pure module's
+  // sync get/set contract is satisfied, then persist a fresh draw if produced.
+  const store: DailyRankingStore = new Map();
+  const key = `thompson_daily:${dateUtc}:${visitor_id}:${surface}:${surface_ref}`;
+
+  const existing = await db.thompson_daily_rankings.findUnique({
+    where: {
+      visitor_id_shop_domain_surface_surface_ref_date_utc: {
+        visitor_id,
+        shop_domain,
+        surface,
+        surface_ref,
+        date_utc: dateUtc,
+      },
+    },
+  });
+  if (existing && existing.ranking.length > 0) {
+    store.set(key, { dateUtc, ranking: existing.ranking });
+  }
+
+  const candidates = await buildCandidates({ shop_domain, surface, surface_ref });
+
+  const result = getOrDrawDailyRanking(store, visitor_id, surface, surface_ref, dateUtc, () =>
+    rankByThompsonSampling(candidates),
+  );
+
+  if (result.drew && result.ranking.length > 0) {
+    await db.thompson_daily_rankings.upsert({
+      where: {
+        visitor_id_shop_domain_surface_surface_ref_date_utc: {
+          visitor_id,
+          shop_domain,
+          surface,
+          surface_ref,
+          date_utc: dateUtc,
+        },
+      },
+      create: {
+        visitor_id,
+        shop_domain,
+        surface,
+        surface_ref,
+        date_utc: dateUtc,
+        ranking: result.ranking,
+      },
+      update: { ranking: result.ranking },
+    });
+  }
+
+  return { ranking: result.ranking, drew: result.drew, date_utc: dateUtc };
+}
+
+/** Concrete stats rows backing a candidate (product_surface_stats grain). */
+export interface CandidateStats {
+  product_id: string;
+  impressions: number;
+  conversions: number;
+}
+
+/**
+ * Build the candidate pool for a (shop_domain, surface, surface_ref) instance:
+ * every `products` row for the shop (zero-history products included with
+ * {impressions: 0, conversions: 0}), enriched by product_surface_stats where a
+ * row exists. conversion = purchases (binary per-visitor, from the rollup).
+ */
+export async function buildCandidates(opts: {
+  shop_domain: string;
+  surface: string;
+  surface_ref: string;
+}): Promise<CandidateStats[]> {
+  const { shop_domain, surface, surface_ref } = opts;
+
+  const [products, statsRows] = await Promise.all([
+    db.products.findMany({
+      where: { shop_domain },
+      select: { product_id: true },
+    }),
+    db.product_surface_stats.findMany({
+      where: { shop_domain, surface, surface_ref },
+      select: { product_id: true, impressions: true, purchases: true },
+    }),
+  ]);
+
+  const statsByProduct = new Map(statsRows.map((s) => [s.product_id, s]));
+
+  return products.map((p) => {
+    const s = statsByProduct.get(p.product_id);
+    return {
+      product_id: p.product_id,
+      impressions: s?.impressions ?? 0,
+      conversions: s?.purchases ?? 0,
+    };
+  });
+}
