@@ -55,12 +55,16 @@ const SHOP = `thompson-e2e-${Date.now()}.myshopify.com`;
 const SURFACE = "collection";
 const REF = "e2e-thompson-collection";
 
-const P1 = randomUUID(); // winner: 10 impressions, 2 conversions
-const P2 = randomUUID(); // 4 impressions, 0 conversions
-const P3 = randomUUID(); // 1 impression, 0 conversions
-const P4 = randomUUID(); // ZERO impressions -> no stats row, still ranked
-const EXCLUDED_PID = randomUUID(); // is_excluded: true -> NEVER ranked
-const OOS_PID = randomUUID(); // inventory_available: 0 -> NEVER ranked
+// Shopify canonical product ids are NUMERIC strings (that's what the rank
+// request's product_ids filter and the client's card-id resolution accept).
+const P1 = "9000001"; // winner: 10 impressions, 2 conversions
+const P2 = "9000002"; // 4 impressions, 0 conversions
+const P3 = "9000003"; // 1 impression, 0 conversions
+const P4 = "9000004"; // ZERO impressions -> no stats row, still ranked
+const EXCLUDED_PID = "9000005"; // is_excluded: true -> NEVER ranked
+const OOS_PID = "9000006"; // inventory_available: 0 -> NEVER ranked
+const UNMATCHED_PID = "9000007"; // in-stock, has COLLECTION stats, NOT a search match
+const SEARCH_REF = "e2e-query"; // the synthetic search query (surface=search)
 
 const TREAT = randomUUID(); // treatment-arm visitor (seeded assignment)
 const CTRL = randomUUID(); // control-arm visitor (seeded assignment)
@@ -93,13 +97,18 @@ function signedQuery(extra) {
   return qs.toString();
 }
 
-async function getRank(visitorId, { tamper = false } = {}) {
-  const qs = signedQuery({
+async function getRank(
+  visitorId,
+  { tamper = false, surface = SURFACE, surfaceRef = REF, productIds = null } = {},
+) {
+  const params = {
     visitor_id: visitorId,
-    surface: SURFACE,
-    surface_ref: REF,
+    surface,
+    surface_ref: surfaceRef,
     shop: SHOP,
-  });
+  };
+  if (productIds !== null) params.product_ids = productIds;
+  const qs = signedQuery(params);
   const suffix = tamper ? "0" : "";
   const response = await fetch(`${BASE}/api/proxy/rank?${qs}${suffix}`);
   let body = null;
@@ -213,6 +222,10 @@ async function seed() {
       { id: P5, overrides: { is_excluded: true, inventory_available: 25 } },
       // Out of stock on purpose: in stock nowhere, must not be ranked.
       { id: P6, overrides: { inventory_available: 0 } },
+      // Never matched by the (synthetic) search query — in stock, will get
+      // COLLECTION-surface stats only. Must never be ranked on the search
+      // surface: this is the candidate-scoping proof.
+      { id: UNMATCHED_PID, overrides: {} },
     ].map(({ id, overrides }, i) => ({
       product_id: id,
       shop_domain: SHOP,
@@ -247,13 +260,19 @@ async function seed() {
   });
 
   const at = (offsetDays) => new Date(now + offsetDays * 24 * 3600 * 1000);
-  const impression = (visitor_id, product_id, offsetDays) => ({
+  const impression = (
+    visitor_id,
+    product_id,
+    offsetDays,
+    sfc = SURFACE,
+    sref = REF,
+  ) => ({
     visitor_id,
     shop_domain: SHOP,
     event_type: "product_impression",
     product_id,
-    surface: SURFACE,
-    surface_ref: REF,
+    surface: sfc,
+    surface_ref: sref,
     occurred_at: at(offsetDays),
   });
   const checkout = (visitor_id, product_id, revenue, offsetDays) => ({
@@ -277,6 +296,13 @@ async function seed() {
   // missing data) is what keeps them out of the ranking.
   for (let i = 0; i < 5; i++) events.push(impression(TREAT, EXCLUDED_PID, -1));
   for (let i = 0; i < 4; i++) events.push(impression(TREAT, OOS_PID, -1));
+  // Search-surface instance: P1 is a real Shopify match for the query (gets
+  // search impressions -> search stats); UNMATCHED gets COLLECTION impressions
+  // only (stats exist there, but it is NOT in the search match set).
+  for (let i = 0; i < 5; i++) {
+    events.push(impression(TREAT, P1, -1, "search", SEARCH_REF));
+  }
+  for (let i = 0; i < 3; i++) events.push(impression(TREAT, UNMATCHED_PID, -1));
 
   // In-window purchases: two DISTINCT treatment visitors -> purchases = 2.
   events.push(checkout(TREAT, P1, "25.50", -1));
@@ -300,7 +326,7 @@ async function main() {
   console.log("[setup] seeding synthetic events ...");
   await cleanup();
   const eventCount = await seed();
-  console.log(`  seeded ${eventCount} events, 6 products, 3 assignments\n`);
+  console.log(`  seeded ${eventCount} events, 7 products, 3 assignments\n`);
 
   console.log("[boot] starting app server on port " + PORT + " ...");
   await startServer();
@@ -330,8 +356,12 @@ async function main() {
   const asSet = new Set(ranking1 || []);
   check("zero-impression product P4 included (uninformative prior protects it)", asSet.has(P4));
   check(
-    "all ELIGIBLE products ranked (P1-P4; the 2 filtered ones are asserted below)",
-    asSet.size === 4 && asSet.has(P1) && asSet.has(P2) && asSet.has(P3),
+    "all ELIGIBLE collection products ranked (P1-P4 + unmatched-in-stock; excluded & OOS filtered)",
+    asSet.size === 5 &&
+      asSet.has(P1) &&
+      asSet.has(P2) &&
+      asSet.has(P3) &&
+      asSet.has(UNMATCHED_PID),
     `size=${asSet.size}`,
   );
   check(
@@ -381,6 +411,12 @@ async function main() {
     !!s6 && s6.impressions === 4,
     s6 && String(s6.impressions),
   );
+  const su = byP.get(UNMATCHED_PID);
+  check(
+    "unmatched product HAS collection stats (3 impressions) — yet is never search-ranked (see [6])",
+    !!su && su.impressions === 3,
+    su && String(su.impressions),
+  );
 
   // --- 4. Daily cache: same visitor/day => identical order -----------------
   console.log("[4] daily ranking cache");
@@ -427,6 +463,93 @@ async function main() {
       pathname: "/products/some-product",
       href: `https://${SHOP}/products/some-product`,
     }) === false,
+  );
+  const searchPageUrl = `https://${SHOP}/search?q=${SEARCH_REF}`;
+  check(
+    "treatment on search results page -> ranking applies (surface=search wired)",
+    core.shouldApplyRanking("treatment", {
+      pathname: "/search",
+      search: `?q=${SEARCH_REF}`,
+      href: searchPageUrl,
+    }) === true,
+  );
+  check(
+    "control on search results page -> NO ranking",
+    core.shouldApplyRanking("control", {
+      pathname: "/search",
+      search: `?q=${SEARCH_REF}`,
+      href: searchPageUrl,
+    }) === false,
+  );
+
+  // --- 6. Search-surface candidate scoping ---------------------------------
+  console.log("[6] search-surface scoping (only Shopify-matched products are candidates)");
+  const matchedIds = [P1, P2, OOS_PID].join(",");
+  const searchFirst = await getRank(TREAT, {
+    surface: "search",
+    surfaceRef: SEARCH_REF,
+    productIds: matchedIds,
+  });
+  check("search rank request is 200", searchFirst.status === 200, `status=${searchFirst.status}`);
+  check(
+    "search ranking scoped to the match set (len=2)",
+    !!searchFirst.body &&
+      Array.isArray(searchFirst.body.ranking) &&
+      searchFirst.body.ranking.length === 2,
+    searchFirst.body && searchFirst.body.ranking && searchFirst.body.ranking.length,
+  );
+  const searchSet = new Set(searchFirst.body && searchFirst.body.ranking);
+  check(
+    "matched products ranked: P1 (has search stats) AND P2 (zero-history, prior protects it)",
+    searchSet.has(P1) && searchSet.has(P2),
+  );
+  check(
+    "matched but OUT-OF-STOCK product excluded (merchant filter applies on search too)",
+    !searchSet.has(OOS_PID),
+  );
+  check(
+    "UNMATCHED products NEVER ranked despite shop eligibility/stats (P3, excluded, unmatched)",
+    !searchSet.has(P3) && !searchSet.has(EXCLUDED_PID) && !searchSet.has(UNMATCHED_PID),
+  );
+  const searchStats = await db.product_surface_stats.findMany({
+    where: { shop_domain: SHOP, surface: "search", surface_ref: SEARCH_REF },
+  });
+  check(
+    "search-surface stats rollup populated (P1: 5 impressions on the search instance)",
+    searchStats.length === 1 &&
+      searchStats[0].product_id === P1 &&
+      searchStats[0].impressions === 5,
+    `rows=${searchStats.length}`,
+  );
+  const searchSecond = await getRank(TREAT, {
+    surface: "search",
+    surfaceRef: SEARCH_REF,
+    productIds: matchedIds,
+  });
+  check(
+    "search second call cached (drew=false, identical order)",
+    !!searchSecond.body &&
+      searchSecond.body.drew === false &&
+      JSON.stringify(searchSecond.body.ranking) === JSON.stringify(searchFirst.body.ranking),
+  );
+  const noIds = await getRank(TREAT, { surface: "search", surfaceRef: SEARCH_REF });
+  check(
+    "search request WITHOUT product_ids fails safe to empty ranking (never whole-shop pool)",
+    noIds.status === 200 &&
+      !!noIds.body &&
+      Array.isArray(noIds.body.ranking) &&
+      noIds.body.ranking.length === 0,
+  );
+  const garbageIds = await getRank(TREAT, {
+    surface: "search",
+    // A DIFFERENT query (no cached ranking yet) whose match set contains no
+    // eligible products: the draw must be empty, never the whole-shop pool.
+    surfaceRef: SEARCH_REF + "-no-eligible",
+    productIds: "999999,888888",
+  });
+  check(
+    "search request with no ELIGIBLE ids also fails safe to empty ranking",
+    garbageIds.status === 200 && !!garbageIds.body && garbageIds.body.ranking.length === 0,
   );
 
   // --- Summary --------------------------------------------------------------

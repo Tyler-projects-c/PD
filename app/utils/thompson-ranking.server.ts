@@ -54,6 +54,9 @@ export async function drawOrReuseDailyRanking(opts: {
   surface: string;
   surface_ref: string;
   date_utc?: string;
+  /** Search scoping: intersect the eligible pool with Shopify's own match set
+   * (numeric ids from the client's /search.json fetch). Narrow-only. */
+  allowed_product_ids?: string[];
 }): Promise<{ ranking: string[]; drew: boolean; date_utc: string }> {
   const { visitor_id, shop_domain, surface, surface_ref } = opts;
   const dateUtc = opts.date_utc ?? utcDateString(new Date());
@@ -78,7 +81,7 @@ export async function drawOrReuseDailyRanking(opts: {
     store.set(key, { dateUtc, ranking: existing.ranking });
   }
 
-  const candidates = await buildCandidates({ shop_domain, surface, surface_ref });
+  const candidates = await buildCandidates({ shop_domain, surface, surface_ref, allowed_product_ids: opts.allowed_product_ids });
 
   const result = getOrDrawDailyRanking(store, visitor_id, surface, surface_ref, dateUtc, () =>
     rankByThompsonSampling(candidates),
@@ -133,11 +136,18 @@ export interface CandidateStats {
  *   - is_pinned / launch_window_end: intentionally NOT acted on — no code or
  *     UI anywhere assigns them meaning yet; inventing semantics here would
  *     guess at merchant intent (known deliberate gap).
+ *   - allowed_product_ids (search surface only): intersect with Shopify's own
+ *     /search.json match set passed by the client. Narrow-only — it can
+ *     shrink the pool, never widen it. The daily cache grain is unchanged,
+ *     so a repeat request the same day returns the same cached order even if
+ *     Shopify's match set shifted (no relevance blending, by decision).
  */
 export async function buildCandidates(opts: {
   shop_domain: string;
   surface: string;
   surface_ref: string;
+  /** See doc above: search-surface scoping, intersect-only. */
+  allowed_product_ids?: string[];
 }): Promise<CandidateStats[]> {
   const { shop_domain, surface, surface_ref } = opts;
 
@@ -158,7 +168,15 @@ export async function buildCandidates(opts: {
 
   const statsByProduct = new Map(statsRows.map((s) => [s.product_id, s]));
 
-  return products.map((p) => {
+  // Search scoping: intersect (narrow-only) with Shopify's own match set.
+  const allowed = opts.allowed_product_ids
+    ? new Set(opts.allowed_product_ids)
+    : null;
+  const eligible = allowed
+    ? products.filter((p) => allowed.has(p.product_id))
+    : products;
+
+  return eligible.map((p) => {
     const s = statsByProduct.get(p.product_id);
     return {
       product_id: p.product_id,

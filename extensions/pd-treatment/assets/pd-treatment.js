@@ -102,16 +102,17 @@
   /**
    * Pure decision function (also exercised by the Node verification harness):
    * true when the Thompson Sampling ranking should be applied for this page
-   * view — treatment-arm visitor on a collection page with NO explicit
-   * sort_by. (The placeholder's sort redirect is gone, so a sort_by present
-   * now always means the shopper picked it — never fight it.)
+   * view — treatment-arm visitor on a collection OR search-results page with
+   * NO explicit sort_by. resolveSurface (the impression tracker's own
+   * detector) decides which surface this is; a sort_by present always means
+   * the shopper picked it — never fight it.
    */
   function shouldApplyRanking(variant, locationLike) {
     if (variant !== "treatment") {
       return false; // control / null (no active experiment) -> default order
     }
-    if (!parseCollectionHandle(locationLike.pathname)) {
-      return false; // not a collection page
+    if (!resolveSurface(locationLike.pathname, locationLike.search)) {
+      return false; // neither a collection nor a search-results page
     }
     var url = new URL(locationLike.href);
     return !url.searchParams.has("sort_by");
@@ -264,11 +265,11 @@
     return created;
   }
 
-  function assign(visitorId, handle) {
+  function assign(visitorId, surfaceInfo) {
     var params = new URLSearchParams({
       visitor_id: visitorId,
-      surface: "collection",
-      surface_ref: handle,
+      surface: surfaceInfo.surface,
+      surface_ref: surfaceInfo.surfaceRef,
     });
     var shopDomain = (window.Shopify && window.Shopify.shop) || "";
     if (shopDomain) {
@@ -285,17 +286,22 @@
   }
 
   /**
-   * Fetch the day's Thompson ranking for this visitor+collection from the
-   * app proxy (same-origin; Shopify signs the request server-side). Resolves
-   * { ranking, drew, date_utc } or null on any failure — null means "keep
-   * the default order".
+   * Fetch the day's Thompson ranking for this visitor+surface instance from
+   * the app proxy (same-origin; Shopify signs the request server-side).
+   * For surface=search, productIds carries Shopify's own match set (numeric
+   * ids from the /search.json fetch the impression tracker already made) so
+   * the server can scope the candidate pool. Resolves { ranking, drew,
+   * date_utc } or null on any failure — null means "keep the default order".
    */
-  function fetchDailyRanking(visitorId, handle) {
+  function fetchDailyRanking(visitorId, surfaceInfo, productIds) {
     var params = new URLSearchParams({
       visitor_id: visitorId,
-      surface: "collection",
-      surface_ref: handle,
+      surface: surfaceInfo.surface,
+      surface_ref: surfaceInfo.surfaceRef,
     });
+    if (productIds && productIds.length > 0) {
+      params.set("product_ids", productIds.join(","));
+    }
     var shopDomain = (window.Shopify && window.Shopify.shop) || "";
     if (shopDomain) {
       params.set("shop", shopDomain); // fallback; the proxy also signs `shop`
@@ -742,24 +748,48 @@
     console.log("[PD treatment] impression tracking failed; continuing", error);
   }
 
-  var handle = parseCollectionHandle(window.location.pathname);
-  if (!handle) {
-    return; // not a collection page — identity published, nothing else to do
+  var surfaceInfo = resolveSurface(window.location.pathname, window.location.search);
+  if (!surfaceInfo) {
+    return; // neither a collection nor a search page — identity published, nothing else to do
   }
 
-  assign(visitorId, handle).then(function (result) {
+  assign(visitorId, surfaceInfo).then(function (result) {
     var variant = result && result.variant;
     console.log(
-      "[PD treatment] handle=" + handle + " variant=" + (variant || "none") +
+      "[PD treatment] surface=" + surfaceInfo.surface +
+      " ref=" + surfaceInfo.surfaceRef + " variant=" + (variant || "none") +
       " visitor=" + visitorId
     );
     if (!shouldApplyRanking(variant, window.location)) {
       return; // control / no experiment / shopper-picked sort -> default order
     }
-    // Thompson Sampling treatment (replaces the placeholder sort redirect):
-    // fetch the day's cached/drawn ranking for this visitor+collection and
-    // re-order the grid client-side. Any failure keeps the default order.
-    fetchDailyRanking(visitorId, handle)
+    // Thompson Sampling treatment: fetch the day's cached/drawn ranking for
+    // this visitor+surface instance and re-order the grid client-side. Any
+    // failure keeps the default order.
+    //
+    // Search scoping: for surface=search the candidate pool must be Shopify's
+    // own match set for the query. The impression tracker already fetched
+    // /search.json into the shared handle->id map — pass its numeric ids to
+    // the rank request so the server can intersect (narrow-only). No ids ->
+    // no ranking (default order), never the whole-shop pool.
+    var rankedPromise;
+    if (surfaceInfo.surface === "search") {
+      rankedPromise = whenHandleIdMapReady(RANK_ID_MAP_TIMEOUT_MS).then(function (map) {
+        var ids = [];
+        for (var key in map) {
+          var id = String(map[key]);
+          if (/^\d+$/.test(id)) ids.push(id);
+        }
+        if (ids.length === 0) {
+          console.log("[PD treatment] no matched product ids for search; leaving default order");
+          return null;
+        }
+        return fetchDailyRanking(visitorId, surfaceInfo, ids);
+      });
+    } else {
+      rankedPromise = fetchDailyRanking(visitorId, surfaceInfo, null);
+    }
+    rankedPromise
       .then(function (payload) {
         var ranking = payload && Array.isArray(payload.ranking) ? payload.ranking : null;
         if (!ranking || ranking.length === 0) {

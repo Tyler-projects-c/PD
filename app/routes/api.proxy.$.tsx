@@ -80,9 +80,35 @@ async function handleRank(request: Request, url: URL): Promise<Response> {
     "";
   const surface = url.searchParams.get("surface") ?? "collection";
   const surfaceRef = url.searchParams.get("surface_ref") ?? "";
+  // Search candidate scoping: for surface=search the client passes the numeric
+  // product ids from Shopify's own /search.json result set (the same fetch the
+  // impression tracker already made — zero extra requests). The server only
+  // ever INTERSECTS the eligible pool with this list: a client can narrow its
+  // own ranking, never widen the pool or affect other visitors (cache is
+  // per-visitor). Collection rankings ignore this param — their pool is
+  // defined by the DB, not the client.
+  const productIdsParam = url.searchParams.get("product_ids") ?? "";
+  const allowedProductIds = productIdsParam
+    ? productIdsParam
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => /^\d+$/.test(s))
+        .slice(0, 500)
+    : [];
 
   if (!visitorId || !shopDomain || !surfaceRef) {
     return Response.json({ ranking: [], error: "invalid_request" }, { status: 400 });
+  }
+
+  // Fail-safe: a search ranking MUST be scoped to real search matches. No ids
+  // (or none eligible) => empty ranking => the theme script keeps the default
+  // order. NEVER fall back to the whole-shop pool for search.
+  if (surface === "search" && allowedProductIds.length === 0) {
+    return Response.json({
+      ranking: [],
+      drew: false,
+      date_utc: new Date().toISOString().slice(0, 10),
+    });
   }
 
   try {
@@ -102,6 +128,7 @@ async function handleRank(request: Request, url: URL): Promise<Response> {
       shop_domain: shopDomain,
       surface,
       surface_ref: surfaceRef,
+      allowed_product_ids: surface === "search" ? allowedProductIds : undefined,
     });
     return Response.json({
       ranking: result.ranking,
