@@ -10,6 +10,12 @@
  *    impressions/purchases; products WITHOUT a stats row still participate as
  *    zero-history candidates {impressions: 0, conversions: 0} so the
  *    uninformative prior protects/explores them rather than excluding them.
+ *    Merchant control fields are honored at the pool boundary:
+ *    is_excluded products are never candidates, and out-of-stock products
+ *    (inventory_available <= 0) are never candidates. CAVEAT: no product/
+ *    inventory sync exists in this app yet, so inventory_available sits at its
+ *    schema default (0) until a sync populates it — the filter must be paired
+ *    with that sync work, or it filters everything (flagged to the owner).
  *
  * 2. DAILY RANKING (locked #5): draw once per (visitor_id, surface, surface_ref)
  *    per UTC calendar day via getOrDrawDailyRanking, backed by a DURABLE store
@@ -113,9 +119,20 @@ export interface CandidateStats {
 
 /**
  * Build the candidate pool for a (shop_domain, surface, surface_ref) instance:
- * every `products` row for the shop (zero-history products included with
- * {impressions: 0, conversions: 0}), enriched by product_surface_stats where a
- * row exists. conversion = purchases (binary per-visitor, from the rollup).
+ * every eligible `products` row for the shop (zero-history products included
+ * with {impressions: 0, conversions: 0}), enriched by product_surface_stats
+ * where a row exists. conversion = purchases (binary per-visitor, from the
+ * rollup).
+ *
+ * Eligibility (merchant control fields, honored at the pool boundary):
+ *   - is_excluded: merchant opted the product out of merchandising entirely.
+ *   - inventory_available > 0: ranking an out-of-stock product up hurts
+ *     conversion. NOTE: nothing in this app syncs inventory yet — until a
+ *     product sync populates this column it is 0 by default and would filter
+ *     every product. The future sync MUST set it (see module header caveat).
+ *   - is_pinned / launch_window_end: intentionally NOT acted on — no code or
+ *     UI anywhere assigns them meaning yet; inventing semantics here would
+ *     guess at merchant intent (known deliberate gap).
  */
 export async function buildCandidates(opts: {
   shop_domain: string;
@@ -126,7 +143,11 @@ export async function buildCandidates(opts: {
 
   const [products, statsRows] = await Promise.all([
     db.products.findMany({
-      where: { shop_domain },
+      where: {
+        shop_domain,
+        is_excluded: false,
+        inventory_available: { gt: 0 },
+      },
       select: { product_id: true },
     }),
     db.product_surface_stats.findMany({

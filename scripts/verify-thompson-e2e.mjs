@@ -59,6 +59,8 @@ const P1 = randomUUID(); // winner: 10 impressions, 2 conversions
 const P2 = randomUUID(); // 4 impressions, 0 conversions
 const P3 = randomUUID(); // 1 impression, 0 conversions
 const P4 = randomUUID(); // ZERO impressions -> no stats row, still ranked
+const EXCLUDED_PID = randomUUID(); // is_excluded: true -> NEVER ranked
+const OOS_PID = randomUUID(); // inventory_available: 0 -> NEVER ranked
 
 const TREAT = randomUUID(); // treatment-arm visitor (seeded assignment)
 const CTRL = randomUUID(); // control-arm visitor (seeded assignment)
@@ -199,13 +201,26 @@ async function seed() {
   const now = Date.now();
   const assignedAt = new Date(now - 2 * 24 * 3600 * 1000); // 2 days ago
 
+  const P5 = EXCLUDED_PID; // merchant-excluded (is_excluded: true), has stats
+  const P6 = OOS_PID; // out-of-stock (inventory_available: 0), has stats
   await db.products.createMany({
-    data: [P1, P2, P3, P4].map((id, i) => ({
+    data: [
+      { id: P1, overrides: {} },
+      { id: P2, overrides: {} },
+      { id: P3, overrides: {} },
+      { id: P4, overrides: {} },
+      // Excluded on purpose: merchant opted it out despite healthy stats.
+      { id: P5, overrides: { is_excluded: true, inventory_available: 25 } },
+      // Out of stock on purpose: in stock nowhere, must not be ranked.
+      { id: P6, overrides: { inventory_available: 0 } },
+    ].map(({ id, overrides }, i) => ({
       product_id: id,
       shop_domain: SHOP,
       title: `E2E Thompson Product ${i + 1}`,
       price: (i + 1) * 10,
       created_at: new Date(now),
+      inventory_available: 10,
+      ...overrides,
     })),
   });
   await db.visitors.createMany({
@@ -257,6 +272,11 @@ async function seed() {
   for (let i = 0; i < 4; i++) events.push(impression(TREAT, P2, -1));
   events.push(impression(TREAT, P3, -1));
   // P4: deliberately zero impressions.
+  // P5 (excluded) and P6 (out-of-stock) GET impressions on purpose: their
+  // product_surface_stats rows will exist, proving the candidate filter (not
+  // missing data) is what keeps them out of the ranking.
+  for (let i = 0; i < 5; i++) events.push(impression(TREAT, EXCLUDED_PID, -1));
+  for (let i = 0; i < 4; i++) events.push(impression(TREAT, OOS_PID, -1));
 
   // In-window purchases: two DISTINCT treatment visitors -> purchases = 2.
   events.push(checkout(TREAT, P1, "25.50", -1));
@@ -280,7 +300,7 @@ async function main() {
   console.log("[setup] seeding synthetic events ...");
   await cleanup();
   const eventCount = await seed();
-  console.log(`  seeded ${eventCount} events, 4 products, 3 assignments\n`);
+  console.log(`  seeded ${eventCount} events, 6 products, 3 assignments\n`);
 
   console.log("[boot] starting app server on port " + PORT + " ...");
   await startServer();
@@ -310,9 +330,17 @@ async function main() {
   const asSet = new Set(ranking1 || []);
   check("zero-impression product P4 included (uninformative prior protects it)", asSet.has(P4));
   check(
-    "all seeded products ranked",
+    "all ELIGIBLE products ranked (P1-P4; the 2 filtered ones are asserted below)",
     asSet.size === 4 && asSet.has(P1) && asSet.has(P2) && asSet.has(P3),
     `size=${asSet.size}`,
+  );
+  check(
+    "merchant-excluded product (is_excluded) NEVER appears in the ranking",
+    !asSet.has(EXCLUDED_PID),
+  );
+  check(
+    "out-of-stock product (inventory_available = 0) NEVER appears in the ranking",
+    !asSet.has(OOS_PID),
   );
 
   // --- 3. Rollup correctness ----------------------------------------------
@@ -339,6 +367,20 @@ async function main() {
   check("P2 stats: 4 impressions, 0 purchases", !!s2 && s2.impressions === 4 && s2.purchases === 0);
   check("P3 stats: 1 impression", !!s3 && s3.impressions === 1);
   check("P4 has NO stats row (zero impressions) but IS ranked", !byP.has(P4) && asSet.has(P4));
+  // P5/P6 stats rows MUST exist (the rollup is unfiltered by design — this
+  // proves the candidate filter, not missing data, keeps them unranked).
+  const s5 = byP.get(EXCLUDED_PID);
+  const s6 = byP.get(OOS_PID);
+  check(
+    "excluded product HAS a stats row (5 impressions) — rollup untouched, filter is candidate-stage",
+    !!s5 && s5.impressions === 5,
+    s5 && String(s5.impressions),
+  );
+  check(
+    "out-of-stock product HAS a stats row (4 impressions) — same",
+    !!s6 && s6.impressions === 4,
+    s6 && String(s6.impressions),
+  );
 
   // --- 4. Daily cache: same visitor/day => identical order -----------------
   console.log("[4] daily ranking cache");
@@ -348,6 +390,11 @@ async function main() {
   check(
     "same visitor/day returns the IDENTICAL cached order",
     JSON.stringify(second.body && second.body.ranking) === JSON.stringify(ranking1),
+  );
+  const secondSet = new Set((second.body && second.body.ranking) || []);
+  check(
+    "cached order also excludes the excluded/out-of-stock products",
+    !secondSet.has(EXCLUDED_PID) && !secondSet.has(OOS_PID),
   );
 
   // --- 5. Arm gating (client side, from the real extension asset) ----------
