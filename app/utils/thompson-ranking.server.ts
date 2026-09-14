@@ -160,6 +160,9 @@ export async function buildCandidates(opts: {
         shop_domain,
         is_excluded: false,
         inventory_available: { gt: 0 },
+        // Deleted-in-Shopify / draft / archived products are unrankable
+        // (flagged by product-sync, never deleted locally — see module doc).
+        deleted_at: null,
       },
       select: { product_id: true, price: true },
     }),

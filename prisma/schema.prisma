@@ -108,6 +108,15 @@ model products {
   is_excluded           Boolean                 @default(false)
   launch_window_end     DateTime?               @db.Timestamptz(6)
   last_synced_at        DateTime                @default(now()) @db.Timestamptz(6)
+  /// Set by product-sync (webhooks + reconciliation): product deleted in
+  /// Shopify, or draft/archived, or absent from a reconciliation pull. The row
+  /// is KEPT (it is the FK parent of product_surface_stats — deleting would
+  /// destroy attribution history) but the product is unrankable.
+  deleted_at            DateTime?               @db.Timestamptz(6)
+  /// Canonical numeric inventory-item ids (Shopify) of this product's
+  /// variants, for resolving inventory_levels/update webhooks (which carry
+  /// only the inventory_item_id) without an Admin API round-trip.
+  inventory_item_ids    String[]                @default([])
   product_surface_stats product_surface_stats[]
   shops                 shops                   @relation(fields: [shop_domain], references: [shop_domain], onDelete: Cascade, onUpdate: NoAction)
 
@@ -121,6 +130,12 @@ model shops {
   scopes                 String
   installed_at           DateTime                 @default(now()) @db.Timestamptz(6)
   uninstalled_at         DateTime?                @db.Timestamptz(6)
+  /// Per-shop freshness stamp for the daily full-catalog product
+  /// reconciliation pull (product-sync.server.ts), piggybacked on the first
+  /// ranking request of a UTC day. Deliberately separate from
+  /// products.last_synced_at: webhook upserts bump the latter and must NOT
+  /// make the shop look reconciled.
+  products_reconciled_at DateTime?                @db.Timestamptz(6)
   events                 events[]
   experiment_assignments experiment_assignments[]
   product_surface_stats  product_surface_stats[]

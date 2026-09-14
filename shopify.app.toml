@@ -38,6 +38,25 @@ api_version = "2026-07"
   uri = "/webhooks/shop/redact"
   compliance_topics = [ "shop/redact" ]
 
+  # Product/inventory sync (webhook-driven intraday freshness; the daily
+  # full-catalog reconciliation pull is piggybacked on the first ranking
+  # request of a UTC day — see app/utils/product-sync.server.ts).
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/create"
+  topics = [ "products/create" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/update"
+  topics = [ "products/update" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/delete"
+  topics = [ "products/delete" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/inventory_levels/update"
+  topics = [ "inventory_levels/update" ]
+
 [auth]
 redirect_urls = [ ]
 

@@ -4,6 +4,7 @@ import db from "../db.server";
 import { authenticate } from "../shopify.server";
 import { assignVisitorToExperiment } from "../utils/experiments.server";
 import { ensureSurfaceStatsFresh } from "../utils/product-surface-stats.server";
+import { ensureShopProductsReconciled } from "../utils/product-sync.server";
 import { drawOrReuseDailyRanking } from "../utils/thompson-ranking.server";
 
 /**
@@ -70,7 +71,11 @@ const requestSchema = z.object({
  * Returns { ranking: string[], drew: boolean, date_utc }. On any failure
  * ranking is [] — the theme script treats that as "keep the default order".
  */
-async function handleRank(request: Request, url: URL): Promise<Response> {
+async function handleRank(
+  request: Request,
+  url: URL,
+  proxyAdmin: Awaited<ReturnType<typeof authenticate.public.appProxy>>["admin"],
+): Promise<Response> {
   const visitorId = url.searchParams.get("visitor_id") ?? "";
   // Signed `shop` query param wins; the proxy's header is the fallback —
   // same identity resolution as the assign branch below.
@@ -112,6 +117,27 @@ async function handleRank(request: Request, url: URL): Promise<Response> {
   }
 
   try {
+    // PIGGYBACK CADENCE (product-sync): the full-catalog product/inventory
+    // reconciliation pull runs at most once per UTC day per shop, on the
+    // first ranking request — the same pattern as the stats rollup below.
+    // Self-corrects anything a missed/failed webhook left stale. Never
+    // throws; without a session the pull is skipped (webhooks + the next
+    // request with a session cover it).
+    if (proxyAdmin) {
+      const synced = await ensureShopProductsReconciled(db, shopDomain, proxyAdmin);
+      if (synced.ran) {
+        console.log(
+          `[api.proxy.rank] product reconciliation ran for ${shopDomain}:` +
+            ` synced=${synced.synced} markedDeleted=${synced.markedDeleted}`,
+        );
+      }
+    } else {
+      console.warn(
+        `[api.proxy.rank] no Admin session for ${shopDomain}; skipping product reconciliation` +
+          ` (webhooks remain active; the next request with a session will reconcile)`,
+      );
+    }
+
     const refreshed = await ensureSurfaceStatsFresh({
       shop_domain: shopDomain,
       surface,
@@ -150,8 +176,11 @@ async function handle(request: Request): Promise<Response> {
   // normalize that to 401 per this endpoint's contract. Non-Response errors
   // (e.g. DB problems in the session lookup) are re-thrown so they are never
   // misreported as signature failures.
+  let proxyAdmin: Awaited<ReturnType<typeof authenticate.public.appProxy>>["admin"];
   try {
-    await authenticate.public.appProxy(request);
+    // The proxy context carries an authenticated Admin API client whenever an
+    // offline session exists for the shop (undefined otherwise).
+    proxyAdmin = (await authenticate.public.appProxy(request)).admin;
   } catch (error) {
     if (error instanceof Response) {
       // Diagnostics: log server time + params so intermittent 401s can be
@@ -181,7 +210,7 @@ async function handle(request: Request): Promise<Response> {
   // gate above; see the module doc for the trust boundary.
   const subpath = url.pathname.replace(/\/+$/, "").split("/").pop() ?? "";
   if (subpath === "rank") {
-    return handleRank(request, url);
+    return handleRank(request, url, proxyAdmin);
   }
 
   const raw: Record<string, unknown> = {};
