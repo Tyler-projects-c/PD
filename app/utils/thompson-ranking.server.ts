@@ -118,6 +118,9 @@ export interface CandidateStats {
   product_id: string;
   impressions: number;
   conversions: number;
+  /** Unit price from the products table; 0 = unpopulated (see the module's
+   * fallback rules in thompson-sampling.ts — today this is ALWAYS the case). */
+  price: number;
 }
 
 /**
@@ -158,7 +161,7 @@ export async function buildCandidates(opts: {
         is_excluded: false,
         inventory_available: { gt: 0 },
       },
-      select: { product_id: true },
+      select: { product_id: true, price: true },
     }),
     db.product_surface_stats.findMany({
       where: { shop_domain, surface, surface_ref },
@@ -182,6 +185,10 @@ export async function buildCandidates(opts: {
       product_id: p.product_id,
       impressions: s?.impressions ?? 0,
       conversions: s?.purchases ?? 0,
+      // Prisma Decimal -> number. Today always 0 (no sync) — the ranking
+      // module's fraction fallback keeps the live path pure-CVR until a
+      // product sync populates real prices.
+      price: Number(p.price),
     };
   });
 }

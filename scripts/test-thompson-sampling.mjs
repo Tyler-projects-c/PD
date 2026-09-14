@@ -23,6 +23,8 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_PRIOR_ALPHA,
   DEFAULT_PRIOR_BETA,
+  REVENUE_WEIGHT_FALLBACK_FRACTION,
+  resetFallbackWarningForTests,
   posteriorParams,
   sampleBeta,
   sampleBetaForCandidate,
@@ -220,4 +222,107 @@ test("sampleBeta is a valid sampler: Beta(1,1) as Uniform, Beta(2,5) mean = 2/7"
 
   assert.throws(() => sampleBeta(0, 1), /alpha,beta > 0/);
   assert.throws(() => sampleBeta(1, -2), /alpha,beta > 0/);
+});
+
+// ---------------------------------------------------------------------------
+// Revenue weighting (ranking key = sampled_CVR * price; model untouched)
+// ---------------------------------------------------------------------------
+
+test("revenue weighting: ranking key is sampled_CVR * price, disagreeing with pure CVR", () => {
+  // Tight posteriors (1000 impressions each) so sampled CVR ~= true CVR:
+  //   cheap:     cvr 0.40 * $10  = $4.00 expected revenue per impression
+  //   expensive: cvr 0.10 * $100 = $10.00 expected revenue per impression
+  // Pure CVR ranking picks "cheap"; revenue-weighted ranking picks
+  // "expensive". Same seeds -> identical underlying Beta draws, so the flip
+  // is purely the ranking-key change, not sampling noise.
+  const mkWithPrice = () => [
+    { product_id: "cheap", impressions: 1000, conversions: 400, price: 10 },
+    { product_id: "expensive", impressions: 1000, conversions: 100, price: 100 },
+  ];
+  const mkWithoutPrice = () => [
+    { product_id: "cheap", impressions: 1000, conversions: 400 },
+    { product_id: "expensive", impressions: 1000, conversions: 100 },
+  ];
+
+  const trials = 5_000;
+  let weightedPicksExpensive = 0;
+  let purePicksCheap = 0;
+  for (let i = 0; i < trials; i++) {
+    const seed = 900_000 + i;
+    if (rankByThompsonSampling(mkWithPrice(), { rng: mulberry32(seed) })[0] === "expensive") {
+      weightedPicksExpensive += 1;
+    }
+    if (rankByThompsonSampling(mkWithoutPrice(), { rng: mulberry32(seed) })[0] === "cheap") {
+      purePicksCheap += 1;
+    }
+  }
+  assert.ok(
+    weightedPicksExpensive / trials > 0.99,
+    `revenue-weighted ranking picks the higher-revenue product ${(weightedPicksExpensive / trials * 100).toFixed(2)}% (need > 99%)`,
+  );
+  assert.ok(
+    purePicksCheap / trials > 0.99,
+    `pure-CVR ranking picks the higher-CVR product ${(purePicksCheap / trials * 100).toFixed(2)}% (need > 99%) — proves the two keys disagree`,
+  );
+});
+
+test("weighted path: unpriced MINORITY gets a neutral 1.0 weight, not zero suppression", () => {
+  // 1 of 2 unpriced -> fraction 0.5 is NOT > 0.5 -> weighted path stays active.
+  //   priced-low:   cvr 0.04 * $5 = 0.20
+  //   unpriced-hot: cvr 0.40 * (neutral 1.0) = 0.40  -> must win
+  // With zero suppression the unpriced product would lose 100% of the time.
+  const priced = { product_id: "priced-low", impressions: 1000, conversions: 40, price: 5 };
+  const unpriced = { product_id: "unpriced-hot", impressions: 1000, conversions: 400 }; // no price field
+  const trials = 5_000;
+  let unpricedFirst = 0;
+  for (let i = 0; i < trials; i++) {
+    const order = rankByThompsonSampling([priced, unpriced], { rng: mulberry32(700_000 + i) });
+    if (order[0] === "unpriced-hot") unpricedFirst += 1;
+  }
+  assert.ok(
+    unpricedFirst / trials > 0.99,
+    `unpriced minority candidate ranked first ${(unpricedFirst / trials * 100).toFixed(2)}% (neutral weight; need > 99%)`,
+  );
+});
+
+test("zero-price MAJORITY falls back to pure-CVR ranking with a loud warning (no crash)", () => {
+  // 2 of 3 unpriced -> fraction 2/3 > 0.5 -> fallback: identical output to a
+  // fully price-less ranking under the same seed, plus a (one-time) warn.
+  assert.equal(REVENUE_WEIGHT_FALLBACK_FRACTION, 0.5);
+  resetFallbackWarningForTests();
+  const a = { product_id: "a", impressions: 100, conversions: 30, price: 50 };
+  const b = { product_id: "b", impressions: 100, conversions: 10 }; // missing price
+  const c = { product_id: "c", impressions: 100, conversions: 20, price: 0 };
+
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (msg) => warnings.push(String(msg));
+  let fallbackOrder;
+  let pricelessOrder;
+  try {
+    fallbackOrder = rankByThompsonSampling([a, b, c], { rng: mulberry32(4242) });
+    pricelessOrder = rankByThompsonSampling(
+      [
+        { product_id: "a", impressions: 100, conversions: 30 },
+        { product_id: "b", impressions: 100, conversions: 10 },
+        { product_id: "c", impressions: 100, conversions: 20 },
+      ],
+      { rng: mulberry32(4242) },
+    );
+    // A fully unpriced single-candidate call must not crash and must return
+    // the candidate — this is the live path today (no price sync exists).
+    const solo = rankByThompsonSampling(
+      [{ product_id: "solo-unpriced", impressions: 3, conversions: 1 }],
+      { rng: mulberry32(99) },
+    );
+    assert.deepEqual(solo, ["solo-unpriced"]);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(fallbackOrder, pricelessOrder);
+  // One-time dedupe: exactly ONE warning for these three fallback calls.
+  assert.equal(warnings.length, 1, `expected exactly one deduped console.warn (got ${warnings.length})`);
+  assert.match(warnings[0], /revenue weighting SKIPPED/);
+  assert.match(warnings[0], /2\/3/);
+  resetFallbackWarningForTests();
 });

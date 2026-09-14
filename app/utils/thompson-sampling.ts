@@ -23,6 +23,20 @@
  * reimplementing it. DEFAULT_CONVERSION_WINDOW_DAYS is exported so wiring and
  * this module share the same default instead of hardcoding a magic number.
  *
+ * RANKING KEY (cheap revenue weighting): candidates may carry an optional
+ * `price` (sourced from the products table by the wiring). When priced data is
+ * available, candidates are ranked by sampled_CVR * price (expected revenue per
+ * impression) instead of sampled CVR alone — SAME Beta-Binomial model, same
+ * draws, only the sort key changes. Safety valves:
+ *   - If a meaningful fraction of candidates (see
+ *     REVENUE_WEIGHT_FALLBACK_FRACTION) has no positive price, the whole call
+ *     falls back to pure-CVR ranking with a loud console.warn — never ship a
+ *     degenerate all-zero-weighted ranking (products.price defaults to 0 and
+ *     no sync populates it yet, so this fallback is the live behavior today).
+ *   - In the weighted path, a minority unpriced candidate gets a NEUTRAL
+ *     weight of 1.0, not 0 — a zero multiplier would silently pin it to last
+ *     place for missing data.
+ *
  * This module contains NO database or Shopify imports and performs no I/O — it
  * is a pure, independently unit-testable scoring function.
  */
@@ -34,6 +48,12 @@ export interface ThompsonCandidate {
   impressions: number;
   /** Binary conversions: distinct visitors who converted in the attribution window. */
   conversions: number;
+  /**
+   * Optional unit price (from the products table) for revenue weighting of the
+   * RANKING KEY (not the model). Missing/non-positive = unpriced: see
+   * rankByThompsonSampling's fallback and neutral-weight rules.
+   */
+  price?: number;
 }
 
 export interface ThompsonSampleOptions {
@@ -48,6 +68,29 @@ export interface ThompsonSampleOptions {
 /** Uninformative Beta(1,1) prior; may be tuned after real pilot data. */
 export const DEFAULT_PRIOR_ALPHA = 1;
 export const DEFAULT_PRIOR_BETA = 1;
+
+/**
+ * Revenue-weighting fallback trigger: if MORE than this fraction of candidates
+ * in a ranking call lacks a positive price, the call falls back to pure-CVR
+ * ranking (with a console.warn) instead of producing a degenerate
+ * all-zero-weighted order. products.price defaults to 0 and nothing syncs it
+ * yet, so with current data EVERY call takes this fallback — revenue weighting
+ * only activates once a product sync populates real prices.
+ */
+export const REVENUE_WEIGHT_FALLBACK_FRACTION = 0.5;
+
+/**
+ * Process-level flag so the fallback warning fires ONCE, not once per ranking
+ * call (a shop with many visitors would otherwise spam identical warnings all
+ * day — the condition doesn't change between calls). Reset via
+ * resetFallbackWarningForTests() in unit tests.
+ */
+let fallbackWarningEmitted = false;
+
+/** Test hook: re-arm the one-time fallback warning. */
+export function resetFallbackWarningForTests(): void {
+  fallbackWarningEmitted = false;
+}
 
 /**
  * Conversion-labeling window (days) shared with app/utils/attribution.server.ts.
@@ -130,10 +173,19 @@ export function sampleBetaForCandidate(
 
 /**
  * Rank candidates by Thompson Sampling: draw ONE sample from each candidate's
- * Beta(alpha, beta) posterior and sort descending by sampled value. A higher
- * draw means a higher posterior-probability that the product's true rate
- * outperforms the others' — displayed first. Returns the ranked product_id
- * list (strings). Candidates are never mutated.
+ * Beta(alpha, beta) posterior. The sort key is the sampled value weighted by
+ * price (expected revenue per impression) when price data is usable:
+ *
+ *   - priced minority (unpriced fraction <= REVENUE_WEIGHT_FALLBACK_FRACTION):
+ *     sort by sampled_CVR * price, with unpriced candidates weighted 1.0
+ *     (neutral — missing data must not zero a product out of the ranking).
+ *   - unpriced majority (> the fallback fraction): loud console.warn and sort
+ *     by raw sampled_CVR — the exact pre-weighting behavior. This is the live
+ *     path today (no price sync exists).
+ *
+ * The MODEL is untouched in both paths: identical posterior, identical draws,
+ * identical exploration. Returns the ranked product_id list (strings).
+ * Candidates are never mutated.
  */
 export function rankByThompsonSampling(
   candidates: ThompsonCandidate[],
@@ -148,11 +200,45 @@ export function rankByThompsonSampling(
     }
     seen.add(productId);
     const { alpha, beta } = posteriorParams(candidate, options);
-    return { productId, sample: sampleBeta(alpha, beta, rng) };
+    return {
+      productId,
+      sample: sampleBeta(alpha, beta, rng),
+      // Neutral 1.0 weight for unpriced candidates (weighted path only).
+      priceWeight:
+        typeof candidate.price === "number" &&
+        Number.isFinite(candidate.price) &&
+        candidate.price > 0
+          ? candidate.price
+          : 1,
+    };
   });
-  // Descending posterior sample. Array.prototype.sort is stable (ES2019+), so
-  // equal draws keep input order — an acceptable tie-break for a random scoring.
-  sampled.sort((a, b) => b.sample - a.sample);
+  if (sampled.length === 0) {
+    return [];
+  }
+
+  const unpricedCount = candidates.filter(
+    (c) => !(typeof c.price === "number" && Number.isFinite(c.price) && c.price > 0),
+  ).length;
+  const unpricedFraction = unpricedCount / sampled.length;
+
+  if (unpricedFraction > REVENUE_WEIGHT_FALLBACK_FRACTION) {
+    if (!fallbackWarningEmitted) {
+      fallbackWarningEmitted = true;
+      console.warn(
+        `[thompson-sampling] revenue weighting SKIPPED: ${unpricedCount}/${sampled.length}` +
+          ` candidates have no positive price (> ${REVENUE_WEIGHT_FALLBACK_FRACTION});` +
+          ` ranking by sampled CVR only (products.price unpopulated? sync missing?)` +
+          ` — further identical warnings suppressed for this process`,
+      );
+    }
+    sampled.sort((a, b) => b.sample - a.sample);
+    return sampled.map(({ productId }) => productId);
+  }
+
+  // Weighted path: price weight already defaults to 1.0 for unpriced candidates.
+  sampled.sort(
+    (a, b) => b.sample * b.priceWeight - a.sample * a.priceWeight,
+  );
   return sampled.map(({ productId }) => productId);
 }
 
