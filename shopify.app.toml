@@ -57,6 +57,14 @@ api_version = "2026-07"
   uri = "/webhooks/inventory_levels/update"
   topics = [ "inventory_levels/update" ]
 
+  # Order revenue verification: Shopify's order ledger (orders/paid) is the
+  # authoritative revenue source that browser-reported checkout_completed rows
+  # are cross-referenced against — see app/routes/webhooks.orders.paid.tsx
+  # and app/utils/order-verification.server.ts.
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/paid"
+  topics = [ "orders/paid" ]
+
 [auth]
 redirect_urls = [ ]
 

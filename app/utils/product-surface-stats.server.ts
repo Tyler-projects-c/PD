@@ -39,6 +39,7 @@
 
 import db from "../db.server";
 import { computeAttribution } from "./attribution.server";
+import { effectiveRevenue } from "./verified-revenue";
 
 /** Locked override: purchases window = 30 days (never 14) for this table. */
 export const SURFACE_STATS_WINDOW_DAYS = 30;
@@ -127,6 +128,10 @@ export async function refreshSurfaceStats(opts: {
         visitor_id: true,
         product_id: true,
         revenue: true,
+        // Webhook-confirmed revenue from orders/paid, when it has landed.
+        // Revenue reads prefer it and fall back to the raw browser value while
+        // verification is pending — see ./verified-revenue.ts.
+        verified_revenue: true,
         occurred_at: true,
       },
     });
@@ -140,10 +145,9 @@ export async function refreshSurfaceStats(opts: {
       if (occurredMs > assignedMs + WINDOW_MS) continue; // outside 30d window
       if (!buyersByProduct.has(pid)) buyersByProduct.set(pid, new Set());
       buyersByProduct.get(pid)!.add(ev.visitor_id);
-      const amount = Number(ev.revenue);
-      if (Number.isFinite(amount)) {
-        revenueByProduct.set(pid, (revenueByProduct.get(pid) ?? 0) + amount);
-      }
+      // Revenue trust hardening: prefer the orders/paid-confirmed value, fall
+      // back to the raw browser-reported value while verification is pending.
+      revenueByProduct.set(pid, (revenueByProduct.get(pid) ?? 0) + effectiveRevenue(ev));
     }
   }
 

@@ -44,6 +44,7 @@
  */
 
 import db from "../db.server";
+import { effectiveRevenue } from "./verified-revenue";
 
 export interface AttributionGroup {
   /** Distinct visitors with an assignment to this instance in this arm. */
@@ -135,7 +136,16 @@ export async function computeAttribution(opts: {
           event_type: "checkout_completed",
           visitor_id: { in: allVisitorIds },
         },
-        select: { visitor_id: true, revenue: true, occurred_at: true },
+        // verified_revenue is pulled alongside the raw browser-reported revenue:
+        // reporting uses the webhook-confirmed value when it exists and falls
+        // back to the raw value while verification is still pending. See
+        // ./verified-revenue.ts for the decision record.
+        select: {
+          visitor_id: true,
+          revenue: true,
+          verified_revenue: true,
+          occurred_at: true,
+        },
       })
     : [];
 
@@ -158,8 +168,9 @@ export async function computeAttribution(opts: {
     if (occurredMs < assignedMs) continue;
     if (occurredMs > assignedMs + windowMs) continue;
     purchasing[arm].add(ev.visitor_id);
-    const amount = Number(ev.revenue);
-    if (Number.isFinite(amount)) revenue[arm] += amount;
+    // Revenue trust hardening: prefer the orders/paid-confirmed value, fall back
+    // to the raw browser-reported value while verification is pending.
+    revenue[arm] += effectiveRevenue(ev);
   }
 
   const group = (arm: Arm): AttributionGroup => {

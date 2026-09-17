@@ -37,3 +37,6 @@ scripts/.smoke/
 /dev-server.log
 /dev-server.err.log
 /dev-server.pid
+
+# Local freebuff CLI state (machine-specific project binding)
+.freebuff/

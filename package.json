@@ -21,6 +21,7 @@
     "sim:thompson": "node scripts/simulate-thompson.mjs",
     "verify:thompson-e2e": "node scripts/verify-thompson-e2e.mjs",
     "verify:product-sync": "node scripts/verify-product-sync.mjs",
+    "verify:revenue": "node scripts/verify-revenue-verification.mjs",
     "typecheck": "react-router typegen && tsc --noEmit"
   },
   "type": "module",
