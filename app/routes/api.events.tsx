@@ -2,6 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { z } from "zod";
 import db from "../db.server";
 import { assignVisitorToExperiment } from "../utils/experiments.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
 
 /**
  * Raw event ingestion endpoint for the PD web pixel (Phase 1).
@@ -34,6 +35,8 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Max-Age": "86400",
 };
+
+const MODULE = "api.events";
 
 const EVENT_TYPES = [
   "page_viewed",
@@ -100,9 +103,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const parsed = payloadSchema.safeParse(rawBody);
   if (!parsed.success) {
-    console.warn(
-      "[api.events] rejected invalid payload:",
-      JSON.stringify(parsed.error.flatten()),
+    logWarn(
+      { module: MODULE, shop_domain: typeof (rawBody as Record<string, unknown> | null)?.shop_domain === "string" ? (rawBody as Record<string, unknown>).shop_domain as string : undefined },
+      "[api.events] rejected invalid payload",
+      { extra: { issues: parsed.error.flatten() } },
     );
     return jsonResponse({ error: "Invalid event payload" }, 400);
   }
@@ -116,8 +120,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   // slow. Persistence failures are logged server-side instead of being
   // surfaced to the storefront sandbox.
   void persistEvent(parsed.data, effectiveVisitorId).catch((error) => {
-    console.error(
-      "[api.events] failed to persist event:",
+    logError(
+      { module: MODULE, shop_domain: parsed.data.shop_domain },
+      "[api.events] failed to persist event",
       error instanceof Error ? error.message : error,
     );
   });
@@ -192,8 +197,9 @@ async function persistEvent(payload: EventPayload, effectiveVisitorId: string) {
       );
       variant = assignment?.variant ?? null;
     } catch (error) {
-      console.error(
-        "[api.events] experiment assignment failed (event still persisted):",
+      logError(
+        { module: MODULE, shop_domain: payload.shop_domain },
+        "[api.events] experiment assignment failed (event still persisted)",
         error instanceof Error ? error.message : error,
       );
     }
@@ -235,7 +241,8 @@ async function persistEvent(payload: EventPayload, effectiveVisitorId: string) {
     } catch (error) {
       if (isUniqueViolation(error)) {
         const dupes = rows.length;
-        console.warn(
+        logWarn(
+          { module: MODULE, shop_domain: payload.shop_domain },
           `[api.events] duplicate checkout_completed POST ignored (idempotent): ` +
             `shop=${payload.shop_domain} order_id=${payload.order_id ?? "null"} ` +
             `rows=${dupes} — already recorded by the unique index.`,

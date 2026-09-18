@@ -1,7 +1,10 @@
 import type { ActionFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
+import { authenticateWebhook } from "../utils/webhook-auth.server";
 import db from "../db.server";
 import { recordComplianceRequest, sanitizeCompliancePayload } from "../utils/compliance.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
+
+const MODULE = "webhooks.customers.data_request";
 
 const LOG_PREFIX = "[gdpr:data_request]";
 
@@ -25,14 +28,16 @@ const TOPIC = "customers/data_request";
  * customer" in the GDPR sense.
  *
  * We log the receipt + what we found to compliance_requests (audit trail) and
- * return 200. HMAC verification is done automatically by authenticate.webhook.
+ * return 200. HMAC verification runs via authenticateWebhook
+ * (app/utils/webhook-auth.server.ts), which logs and reports signature failures
+ * to Sentry before rethrowing the library's 401.
  *
  * PII policy: Shopify's payload includes customer.email/phone, but the audit
  * row persists an allow-listed, PII-free projection of the payload (see
  * sanitizeCompliancePayload) — contact info is omitted entirely, never stored.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, topic, payload } = await authenticate.webhook(request);
+  const { shop, topic, payload } = await authenticateWebhook(request, MODULE);
   const p = (payload ?? {}) as Record<string, any>;
 
   try {
@@ -71,13 +76,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         `Per Shopify GDPR flow the found data is made available to the store owner directly; the app sends no email to the customer.`,
     });
 
-    console.log(
+    logInfo(
+      { module: MODULE, shop_domain: shop },
       `${LOG_PREFIX} ${shop} frameworkTopic=${topic} canonical=${TOPIC} data_request=${p.data_request?.id ?? "-"} matchedEvents=${matched.length}`,
     );
 
     return new Response();
   } catch (err) {
-    console.error(`${LOG_PREFIX} FAILED for ${shop}:`, err);
+    logError(
+      { module: MODULE, shop_domain: shop },
+      `${LOG_PREFIX} FAILED for ${shop}`,
+      err,
+    );
     throw err;
   }
 };

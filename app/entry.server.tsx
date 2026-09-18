@@ -5,8 +5,15 @@ import { createReadableStreamFromReadable } from "@react-router/node";
 import { type EntryContext } from "react-router";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { initSentry } from "./utils/sentry.server";
+import { logError } from "./utils/logger.server";
+
+// Alerting only: without a SENTRY_DSN this is a silent no-op. A human
+// reviews every Sentry alert — no automated remediation is wired anywhere.
 
 export const streamTimeout = 5000;
+
+initSentry();
 
 export default async function handleRequest(
   request: Request,
@@ -45,7 +52,9 @@ export default async function handleRequest(
         },
         onError(error) {
           responseStatusCode = 500;
-          console.error(error);
+          // Structured + Sentry-visible: replaces the bare console.error that
+          // left render failures in a terminal nobody watches.
+          logError({ module: "entry.server" }, "React Router render error (500 returned)", error);
         },
       }
     );

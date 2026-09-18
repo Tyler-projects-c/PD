@@ -1,7 +1,10 @@
 import type { ActionFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
+import { authenticateWebhook } from "../utils/webhook-auth.server";
 import db from "../db.server";
 import { upsertProductFromWebhook } from "../utils/product-sync.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
+
+const MODULE = "webhooks.products.update";
 
 const LOG = "[product-sync:products_update]";
 
@@ -11,13 +14,20 @@ const LOG = "[product-sync:products_update]";
  * and rethrown as a 500 so Shopify retries.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, topic, payload } = await authenticate.webhook(request);
+  const { shop, topic, payload } = await authenticateWebhook(request, MODULE);
   try {
     const productId = await upsertProductFromWebhook(db, shop, payload);
-    console.log(`${LOG} ${shop} topic=${topic} productId=${productId} upserted`);
+    logInfo(
+      { module: MODULE, shop_domain: shop },
+      `${LOG} ${shop} topic=${topic} productId=${productId} upserted`,
+    );
     return new Response();
   } catch (error) {
-    console.error(`${LOG} FAILED for ${shop}:`, error);
+    logError(
+      { module: MODULE, shop_domain: shop },
+      `${LOG} FAILED for ${shop}`,
+      error,
+    );
     throw error; // 500 -> Shopify retries
   }
 };

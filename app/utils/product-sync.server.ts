@@ -29,15 +29,17 @@
  * from one location event — the event is logged and the value is left to the
  * daily reconciliation, which sums variants' inventoryQuantity authoritatively.
  *
- * This module is PURE (no runtime imports): db and admin are injected, so the
- * verify harness (scripts/verify-product-sync.mjs) can drive it directly with
- * the real Prisma client and a fake Admin client.
+ * This module is PURE (no runtime imports beyond the logger): db and admin
+ * are injected, so the verify harness (scripts/verify-product-sync.mjs) can
+ * drive it directly with the real Prisma client and a fake Admin client.
  */
 
 /** PrismaClient type only — erased at runtime (type stripping). */
 import type { PrismaClient } from "@prisma/client";
+import { logError, logInfo, logWarn } from "./logger.server.ts";
 
 const LOG = "[product-sync]";
+const MODULE = "product-sync";
 
 /** Minimal shape of the authenticated Admin API client (admin.graphql). */
 export interface AdminApiClient {
@@ -156,11 +158,15 @@ export async function upsertProductFromWebhook(
 ): Promise<string | null> {
   const product = normalizeProduct(payload);
   if (!product) {
-    console.warn(`${LOG} ${shopDomain} products webhook payload has no recognizable product id; SKIPPED (no local write)`);
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} products webhook payload has no recognizable product id; SKIPPED (no local write)`,
+    );
     return null;
   }
   if (product.price <= 0) {
-    console.warn(
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} product ${product.product_id} has no positive variant price in the webhook payload;` +
         ` storing price=0 (revenue weighting will fall back per its rules)`,
     );
@@ -181,7 +187,10 @@ export async function markProductDeleted(
   const raw = (payload ?? {}) as any;
   const productId = raw.id != null ? String(raw.id) : "";
   if (!productId) {
-    console.warn(`${LOG} ${shopDomain} products/delete payload has no product id; SKIPPED`);
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} products/delete payload has no product id; SKIPPED`,
+    );
     return null;
   }
   const existing = await db.products.findUnique({
@@ -189,7 +198,10 @@ export async function markProductDeleted(
     select: { deleted_at: true },
   });
   if (!existing) {
-    console.warn(`${LOG} ${shopDomain} products/delete for unknown product ${productId}; nothing to flag`);
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} products/delete for unknown product ${productId}; nothing to flag`,
+    );
     return null;
   }
   if (existing.deleted_at) {
@@ -218,7 +230,10 @@ export async function handleInventoryLevelUpdate(
   const itemId = raw.inventory_item_id != null ? String(raw.inventory_item_id) : "";
   const available = Math.max(0, Math.trunc(finiteNumber(raw.available)));
   if (!itemId) {
-    console.warn(`${LOG} ${shopDomain} inventory_levels/update payload has no inventory_item_id; SKIPPED`);
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} inventory_levels/update payload has no inventory_item_id; SKIPPED`,
+    );
     return { product_id: null, updated: false };
   }
   const product = await db.products.findFirst({
@@ -226,14 +241,16 @@ export async function handleInventoryLevelUpdate(
     select: { product_id: true, inventory_item_ids: true },
   });
   if (!product) {
-    console.warn(
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} inventory_levels/update for unknown inventory_item ${itemId};` +
         ` no local product maps to it — the daily reconciliation will cover this product`,
     );
     return { product_id: null, updated: false };
   }
   if (product.inventory_item_ids.length > 1) {
-    console.warn(
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} inventory update for multi-variant product ${product.product_id}` +
         ` (${product.inventory_item_ids.length} items) is location-scoped and not summable from one event;` +
         ` deferring to the daily reconciliation`,
@@ -294,7 +311,10 @@ export async function reconcileShopProducts(
     pages += 1;
     if (pages > 100) {
       // >25,000 products: almost certainly a bug (wrong shop?), stop loudly.
-      console.error(`${LOG} ${shopDomain} reconciliation exceeded 100 catalog pages; aborting pull (data so far still upserted)`);
+      logError(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} reconciliation exceeded 100 catalog pages; aborting pull (data so far still upserted)`,
+    );
       break;
     }
     const response = await admin.graphql(RECONCILE_QUERY, { variables: { after } });
@@ -306,11 +326,17 @@ export async function reconcileShopProducts(
     for (const edge of connection.edges) {
       const product = normalizeProduct(edge?.node);
       if (!product) {
-        console.warn(`${LOG} ${shopDomain} reconciliation page ${pages} has an unrecognizable product node; SKIPPED`);
+        logWarn(
+          { module: MODULE, shop_domain: shopDomain },
+          `${LOG} ${shopDomain} reconciliation page ${pages} has an unrecognizable product node; SKIPPED`,
+        );
         continue;
       }
       if (product.inventory_item_ids.length > 100) {
-        console.warn(`${LOG} ${shopDomain} product ${product.product_id} has ${product.inventory_item_ids.length} variants; only the first 100 were pulled (webhooks + next run cover the rest)`);
+        logWarn(
+          { module: MODULE, shop_domain: shopDomain },
+          `${LOG} ${shopDomain} product ${product.product_id} has ${product.inventory_item_ids.length} variants; only the first 100 were pulled (webhooks + next run cover the rest)`,
+        );
       }
       await upsertNormalized(db, shopDomain, product);
       seen.add(product.product_id);
@@ -332,7 +358,8 @@ export async function reconcileShopProducts(
       where: { shop_domain: shopDomain, product_id: { in: missing } },
       data: { deleted_at: new Date() },
     });
-    console.warn(
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} reconciliation flagged ${missing.length} local product(s) as deleted` +
         ` (absent from the Shopify catalog — likely missed delete webhooks)`,
     );
@@ -364,7 +391,15 @@ export async function ensureShopProductsReconciled(
       select: { products_reconciled_at: true },
     });
     if (!shop) {
-      console.warn(`${LOG} ${shopDomain} not installed locally; skipping product reconciliation`);
+      // unknown-shop signal: a ranking request carried a valid session for a
+      // shop we have NO local row for. That is an install/state divergence
+      // (failed install, partial wipe, wrong database) — worth a human, so it
+      // fans out to Sentry as well as printing.
+      logWarn(
+        { module: MODULE, shop_domain: shopDomain },
+        `${LOG} ${shopDomain} not installed locally; skipping product reconciliation`,
+        { sentry: true, extra: { unknown_shop: true } },
+      );
       return { ran: false };
     }
     if (shop.products_reconciled_at && shop.products_reconciled_at >= todayUtcMidnight()) {
@@ -375,13 +410,17 @@ export async function ensureShopProductsReconciled(
       where: { shop_domain: shopDomain },
       data: { products_reconciled_at: new Date() },
     });
-    console.log(`${LOG} ${shopDomain} daily reconciliation complete: synced=${result.synced} markedDeleted=${result.markedDeleted}`);
+    logInfo(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} daily reconciliation complete: synced=${result.synced} markedDeleted=${result.markedDeleted}`,
+    );
     return { ran: true, synced: result.synced, markedDeleted: result.markedDeleted };
   } catch (error) {
     // LOUD failure, no stamp: the next ranking request retries the pull.
-    console.error(
-      `${LOG} ${shopDomain} daily product reconciliation FAILED (will retry on next ranking request):`,
-      error instanceof Error ? error.message : error,
+    logError(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} daily product reconciliation FAILED (will retry on next ranking request)`,
+      error,
     );
     return { ran: false, error: true };
   }

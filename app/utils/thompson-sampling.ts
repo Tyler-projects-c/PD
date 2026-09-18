@@ -30,7 +30,8 @@
  * draws, only the sort key changes. Safety valves:
  *   - If a meaningful fraction of candidates (see
  *     REVENUE_WEIGHT_FALLBACK_FRACTION) has no positive price, the whole call
- *     falls back to pure-CVR ranking with a loud console.warn — never ship a
+ *     falls back to pure-CVR ranking with a loud structured warn
+ *     (app/utils/logger.server.ts) — never ship a
  *     degenerate all-zero-weighted ranking (products.price defaults to 0 and
  *     no sync populates it yet, so this fallback is the live behavior today).
  *   - In the weighted path, a minority unpriced candidate gets a NEUTRAL
@@ -69,10 +70,12 @@ export interface ThompsonSampleOptions {
 export const DEFAULT_PRIOR_ALPHA = 1;
 export const DEFAULT_PRIOR_BETA = 1;
 
+import { logWarn } from "./logger.server.ts";
+
 /**
  * Revenue-weighting fallback trigger: if MORE than this fraction of candidates
  * in a ranking call lacks a positive price, the call falls back to pure-CVR
- * ranking (with a console.warn) instead of producing a degenerate
+ * ranking (with a structured warn) instead of producing a degenerate
  * all-zero-weighted order. products.price defaults to 0 and nothing syncs it
  * yet, so with current data EVERY call takes this fallback — revenue weighting
  * only activates once a product sync populates real prices.
@@ -179,7 +182,7 @@ export function sampleBetaForCandidate(
  *   - priced minority (unpriced fraction <= REVENUE_WEIGHT_FALLBACK_FRACTION):
  *     sort by sampled_CVR * price, with unpriced candidates weighted 1.0
  *     (neutral — missing data must not zero a product out of the ranking).
- *   - unpriced majority (> the fallback fraction): loud console.warn and sort
+ *   - unpriced majority (> the fallback fraction): loud structured warn and sort
  *     by raw sampled_CVR — the exact pre-weighting behavior. This is the live
  *     path today (no price sync exists).
  *
@@ -224,7 +227,8 @@ export function rankByThompsonSampling(
   if (unpricedFraction > REVENUE_WEIGHT_FALLBACK_FRACTION) {
     if (!fallbackWarningEmitted) {
       fallbackWarningEmitted = true;
-      console.warn(
+      logWarn(
+        { module: "thompson-sampling" },
         `[thompson-sampling] revenue weighting SKIPPED: ${unpricedCount}/${sampled.length}` +
           ` candidates have no positive price (> ${REVENUE_WEIGHT_FALLBACK_FRACTION});` +
           ` ranking by sampled CVR only (products.price unpopulated? sync missing?)` +

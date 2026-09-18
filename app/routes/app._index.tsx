@@ -6,7 +6,9 @@ import type {
 } from "react-router";
 import { useFetcher, useLoaderData } from "react-router";
 import type { action as activatePixelAction } from "./app.pixel";
-import { resyncPixelApiUrl } from "./app.pixel";
+// Server-only: referenced from the loader below, never from the component,
+// so React Router strips it from the client bundle (see the module doc).
+import { resyncPixelApiUrl } from "../utils/pixel-resync.server";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { boundary } from "@shopify/shopify-app-react-router/server";

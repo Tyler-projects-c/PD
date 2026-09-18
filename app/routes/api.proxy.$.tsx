@@ -6,6 +6,8 @@ import { assignVisitorToExperiment } from "../utils/experiments.server";
 import { ensureSurfaceStatsFresh } from "../utils/product-surface-stats.server";
 import { ensureShopProductsReconciled } from "../utils/product-sync.server";
 import { drawOrReuseDailyRanking } from "../utils/thompson-ranking.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
+import { shouldAlertToSentry } from "../utils/alert-throttle.server";
 
 /**
  * Storefront-facing experiment assignment endpoint (placeholder treatment phase).
@@ -51,6 +53,20 @@ import { drawOrReuseDailyRanking } from "../utils/thompson-ranking.server";
  * usable answer (shop not installed, unknown fields, DB error) — the theme
  * script treats that as "default order".
  */
+
+const MODULE = "api.proxy.assign";
+const MODULE_RANK = "api.proxy.rank";
+
+/**
+ * Sentry throttle for the proxy HMAC gate. A signature failure is either a
+ * rotated/misconfigured SHOPIFY_API_SECRET (EVERY storefront assignment is
+ * dead) or an attack — both need a human — but the gate can also fire in
+ * bursts, so alerts are limited to one per window (see
+ * app/utils/alert-throttle.server.ts). 10 minutes keeps a real outage visible
+ * within minutes without letting a burst bury every other alert.
+ */
+const PROXY_HMAC_ALERT_KEY = "api.proxy.hmac_rejected";
+const PROXY_HMAC_ALERT_WINDOW_MS = 10 * 60 * 1000;
 
 const requestSchema = z.object({
   visitor_id: z.string().uuid(),
@@ -126,13 +142,15 @@ async function handleRank(
     if (proxyAdmin) {
       const synced = await ensureShopProductsReconciled(db, shopDomain, proxyAdmin);
       if (synced.ran) {
-        console.log(
+        logInfo(
+          { module: MODULE_RANK, shop_domain: shopDomain },
           `[api.proxy.rank] product reconciliation ran for ${shopDomain}:` +
             ` synced=${synced.synced} markedDeleted=${synced.markedDeleted}`,
         );
       }
     } else {
-      console.warn(
+      logWarn(
+        { module: MODULE_RANK, shop_domain: shopDomain },
         `[api.proxy.rank] no Admin session for ${shopDomain}; skipping product reconciliation` +
           ` (webhooks remain active; the next request with a session will reconcile)`,
       );
@@ -144,7 +162,8 @@ async function handleRank(
       surface_ref: surfaceRef,
     });
     if (refreshed) {
-      console.log(
+      logInfo(
+        { module: MODULE_RANK, shop_domain: shopDomain },
         `[api.proxy.rank] product_surface_stats refreshed for ${shopDomain}/${surface}/${surfaceRef}`,
       );
     }
@@ -162,8 +181,9 @@ async function handleRank(
       date_utc: result.date_utc,
     });
   } catch (error) {
-    console.error(
-      "[api.proxy.rank] ranking failed (returning no ranking):",
+    logError(
+      { module: MODULE_RANK, shop_domain: shopDomain },
+      "[api.proxy.rank] ranking failed (returning no ranking)",
       error instanceof Error ? error.message : error,
     );
     return Response.json({ ranking: [], error: "ranking_failed" });
@@ -183,11 +203,21 @@ async function handle(request: Request): Promise<Response> {
     proxyAdmin = (await authenticate.public.appProxy(request)).admin;
   } catch (error) {
     if (error instanceof Response) {
-      // Diagnostics: log server time + params so intermittent 401s can be
-      // traced (timestamp skew vs. signature canonicalization).
-      console.warn(
-        `[api.proxy.assign] rejected unverified request at ${new Date().toISOString()}:`,
-        new URL(request.url).searchParams.toString(),
+      // Diagnostics: the raw query params and server time are recorded as
+      // STRUCTURED fields so intermittent 401s can be traced (timestamp skew
+      // vs. signature canonicalization) without string-interpolating them into
+      // the message — a stable message is what lets Sentry group this as ONE
+      // issue instead of one per distinct query string.
+      //
+      // 401s are unauthenticated noise by volume, so Sentry is alerted on a
+      // THROTTLE: the first rejection alerts immediately, repeats inside the
+      // window are counted and reported on the next alert. The console line
+      // still prints for EVERY rejection (nothing is hidden locally).
+      const gate = shouldAlertToSentry(PROXY_HMAC_ALERT_KEY, PROXY_HMAC_ALERT_WINDOW_MS);
+      logWarn(
+        { module: MODULE, extra: { status: error.status, proxy_query: new URL(request.url).searchParams.toString(), suppressed_since_last_alert: gate.suppressed } },
+        `[api.proxy.assign] rejected unverified request (HMAC/signature gate): status=${error.status}`,
+        { sentry: gate.alert },
       );
       return Response.json(
         { variant: null, experiment_id: null, error: "invalid_signature" },
@@ -196,9 +226,10 @@ async function handle(request: Request): Promise<Response> {
     }
     // Non-Response errors (DB problems, session lookup failures) surface as
     // 500s through the proxy — log them here so they are diagnosable.
-    console.error(
-      `[api.proxy.assign] authenticate threw at ${new Date().toISOString()}:`,
-      error instanceof Error ? error.message : error,
+    logError(
+      { module: MODULE },
+      `[api.proxy.assign] authenticate threw`,
+      error,
     );
     throw error;
   }
@@ -242,9 +273,10 @@ async function handle(request: Request): Promise<Response> {
 
   const parsed = requestSchema.safeParse(raw);
   if (!parsed.success) {
-    console.warn(
-      "[api.proxy.assign] invalid assignment request:",
-      JSON.stringify(parsed.error.flatten()),
+    logWarn(
+      { module: MODULE, shop_domain: typeof raw.shop_domain === "string" ? raw.shop_domain : undefined },
+      "[api.proxy.assign] invalid assignment request",
+      { extra: { issues: parsed.error.flatten() } },
     );
     return Response.json({ variant: null, experiment_id: null, error: "invalid_request" });
   }
@@ -270,9 +302,10 @@ async function handle(request: Request): Promise<Response> {
       experiment_id: assignment?.experiment_id ?? null,
     });
   } catch (error) {
-    console.error(
-      "[api.proxy.assign] assignment failed (returning no variant):",
-      error instanceof Error ? error.message : error,
+    logError(
+      { module: MODULE, shop_domain: parsed.data.shop_domain },
+      "[api.proxy.assign] assignment failed (returning no variant)",
+      error,
     );
     return Response.json({ variant: null, experiment_id: null, error: "assignment_failed" });
   }

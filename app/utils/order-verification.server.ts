@@ -21,7 +21,8 @@
  *   verified   — webhook matched and per-line revenue agrees within threshold.
  *   mismatch   — webhook matched but differs by more than the threshold; the
  *                webhook value still wins on verified_revenue, and a loud
- *                console.warn records both values.
+ *                structured warn (Sentry-visible — this is a trust-claim
+ *                signal, not routine traffic) records both values.
  *   unverified — still no webhook after the 24h grace window (marked by
  *                sweepStaleVerifications, piggybacked on order webhooks).
  *
@@ -35,15 +36,17 @@
  * verification is still pending) so this table stays the single measurement
  * source for attribution and the Thompson revenue weighting.
  *
- * This module is PURE (db injected, no runtime imports) — same pattern as
- * product-sync.server.ts — so the verify harness can drive it directly with
- * the real Prisma client and synthetic payloads.
+ * This module is PURE (db injected, no runtime imports beyond the logger) —
+ * same pattern as product-sync.server.ts — so the verify harness can drive
+ * it directly with the real Prisma client and synthetic payloads.
  */
 
 /** PrismaClient type only — erased at runtime (type stripping). */
 import type { PrismaClient } from "@prisma/client";
+import { logError, logInfo, logWarn } from "./logger.server.ts";
 
 const LOG = "[order-verification]";
+const MODULE = "order-verification";
 
 /** Per-line agreement threshold: differences at or under a cent are rounding. */
 export const VERIFICATION_ROUNDING_THRESHOLD = 0.01;
@@ -151,11 +154,20 @@ export async function verifyPaidOrder(
 ): Promise<VerifyPaidOrderResult> {
   const { orderId, lines, skippedLines, orderName } = normalizePaidOrder(payload);
   if (!orderId) {
-    console.warn(`${LOG} ${shopDomain} orders/paid payload has no numeric order id; SKIPPED`);
+    // Malformed orders/paid payload: Shopify ALWAYS sends a numeric order id,
+    // so its absence means the payload is malformed (or tampered with) and we
+    // are silently NOT verifying revenue for it. That directly touches the
+    // "provably measured" claim, so it is Sentry-visible, not console-only.
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} orders/paid payload has no numeric order id; SKIPPED`,
+      { sentry: true, extra: { malformed_webhook: true } },
+    );
     return { order_id: "", matchedRows: 0, verifiedRows: 0, mismatchRows: 0, skippedLines };
   }
   if (skippedLines > 0) {
-    console.warn(
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} order ${orderId}: ${skippedLines} webhook line(s) had no mappable numeric product id and were SKIPPED (not smeared across other lines)`,
     );
   }
@@ -169,7 +181,8 @@ export async function verifyPaidOrder(
     // the race (webhook delivery often beats the thank-you-page pixel). Log
     // loudly — if rows NEVER arrive this is the signal — and let a later
     // retry or reconciliation pass pick it up.
-    console.warn(
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} order ${orderId}${orderName ? ` (${orderName})` : ""}: ` +
         `no checkout_completed rows yet for ${lines.size} webhook line(s); will retry on redelivery`,
     );
@@ -190,9 +203,22 @@ export async function verifyPaidOrder(
     const diff = Math.abs(webhookAmount - browserAmount);
     if (Number.isFinite(browserAmount) && diff > VERIFICATION_ROUNDING_THRESHOLD) {
       mismatchRows++;
-      console.warn(
+      // Trust-claim signal: a real browser-vs-ledger disagreement is Sentry
+      // visible (alerting only — a human reviews every mismatch).
+      logWarn(
+        { module: MODULE, shop_domain: shopDomain },
         `${LOG} MISMATCH ${shopDomain} order ${orderId} product ${pid}: ` +
           `browser=${browserAmount} webhook=${webhookAmount} diff=${round2(diff)} — webhook wins`,
+        {
+          extra: {
+            order_id: orderId,
+            product_id: pid,
+            browser_amount: browserAmount,
+            webhook_amount: webhookAmount,
+            diff: round2(diff),
+          },
+          sentry: true,
+        },
       );
     } else {
       verifiedRows++;
@@ -208,11 +234,13 @@ export async function verifyPaidOrder(
   }
 
   if (matchedRows === 0) {
-    console.warn(
+    logWarn(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} order ${orderId}: ${rows.length} checkout row(s) but none matched the ${lines.size} webhook line(s) by product_id`,
     );
   } else {
-    console.log(
+    logInfo(
+      { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} order ${orderId}: matched=${matchedRows} verified=${verifiedRows} mismatch=${mismatchRows}`,
     );
   }
@@ -242,15 +270,17 @@ export async function sweepStaleVerifications(
       data: { verification_status: "unverified" },
     });
     if (result.count > 0) {
-      console.warn(
+      logWarn(
+        { module: MODULE, shop_domain: shopDomain },
         `${LOG} ${shopDomain} marked ${result.count} checkout row(s) unverified (no orders/paid webhook within 24h)`,
       );
     }
     return { marked: result.count };
   } catch (error) {
-    console.error(
-      `${LOG} ${shopDomain} stale-verification sweep FAILED (will retry on next order webhook):`,
-      error instanceof Error ? error.message : error,
+    logError(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} ${shopDomain} stale-verification sweep FAILED (will retry on next order webhook)`,
+      error,
     );
     return { marked: 0 };
   }

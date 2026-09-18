@@ -1,7 +1,10 @@
 import type { ActionFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
+import { authenticateWebhook } from "../utils/webhook-auth.server";
 import db from "../db.server";
 import { handleInventoryLevelUpdate } from "../utils/product-sync.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
+
+const MODULE = "webhooks.inventory_levels.update";
 
 const LOG = "[product-sync:inventory_update]";
 
@@ -12,13 +15,20 @@ const LOG = "[product-sync:inventory_update]";
  * daily reconciliation (see app/utils/product-sync.server.ts).
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, topic, payload } = await authenticate.webhook(request);
+  const { shop, topic, payload } = await authenticateWebhook(request, MODULE);
   try {
     const result = await handleInventoryLevelUpdate(db, shop, payload);
-    console.log(`${LOG} ${shop} topic=${topic} productId=${result.product_id} updated=${result.updated}`);
+    logInfo(
+      { module: MODULE, shop_domain: shop },
+      `${LOG} ${shop} topic=${topic} productId=${result.product_id} updated=${result.updated}`,
+    );
     return new Response();
   } catch (error) {
-    console.error(`${LOG} FAILED for ${shop}:`, error);
+    logError(
+      { module: MODULE, shop_domain: shop },
+      `${LOG} FAILED for ${shop}`,
+      error,
+    );
     throw error; // 500 -> Shopify retries
   }
 };

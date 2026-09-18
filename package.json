@@ -22,6 +22,7 @@
     "verify:thompson-e2e": "node scripts/verify-thompson-e2e.mjs",
     "verify:product-sync": "node scripts/verify-product-sync.mjs",
     "verify:revenue": "node scripts/verify-revenue-verification.mjs",
+    "verify:sentry": "node scripts/verify-sentry-live.mjs",
     "typecheck": "react-router typegen && tsc --noEmit"
   },
   "type": "module",
@@ -34,6 +35,7 @@
     "@react-router/fs-routes": "^7.12.0",
     "@react-router/node": "^7.12.0",
     "@react-router/serve": "^7.12.0",
+    "@sentry/node": "^10.75.0",
     "@shopify/app-bridge-react": "^4.2.4",
     "@shopify/cli": "4.7.0",
     "@shopify/shopify-app-react-router": "^1.2.1",

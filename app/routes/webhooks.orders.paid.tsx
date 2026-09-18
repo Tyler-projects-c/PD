@@ -1,7 +1,10 @@
 import type { ActionFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
+import { authenticateWebhook } from "../utils/webhook-auth.server";
 import db from "../db.server";
 import { sweepStaleVerifications, verifyPaidOrder } from "../utils/order-verification.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
+
+const MODULE = "webhooks.orders.paid";
 
 const LOG = "[product-sync:orders_paid]";
 
@@ -15,19 +18,27 @@ const LOG = "[product-sync:orders_paid]";
  * retries; the sweep itself never throws.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, topic, payload } = await authenticate.webhook(request);
+  const { shop, topic, payload } = await authenticateWebhook(request, MODULE);
   try {
     const result = await verifyPaidOrder(db, shop, payload as Record<string, unknown>);
-    console.log(
+    logInfo(
+      { module: MODULE, shop_domain: shop },
       `${LOG} ${shop} topic=${topic} order=${result.order_id} matched=${result.matchedRows} verified=${result.verifiedRows} mismatch=${result.mismatchRows}`,
     );
     const sweep = await sweepStaleVerifications(db, shop);
     if (sweep.marked > 0) {
-      console.log(`${LOG} ${shop} stale sweep marked=${sweep.marked}`);
+      logInfo(
+        { module: MODULE, shop_domain: shop },
+        `${LOG} ${shop} stale sweep marked=${sweep.marked}`,
+      );
     }
     return new Response();
   } catch (error) {
-    console.error(`${LOG} FAILED for ${shop}:`, error);
+    logError(
+      { module: MODULE, shop_domain: shop },
+      `${LOG} FAILED for ${shop}`,
+      error,
+    );
     throw error; // 500 -> Shopify retries
   }
 };

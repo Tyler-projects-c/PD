@@ -1,7 +1,10 @@
 import type { ActionFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
+import { authenticateWebhook } from "../utils/webhook-auth.server";
 import db from "../db.server";
 import { recordComplianceRequest, sanitizeCompliancePayload } from "../utils/compliance.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
+
+const MODULE = "webhooks.customers.redact";
 
 const LOG_PREFIX = "[gdpr:customers_redact]";
 
@@ -28,7 +31,7 @@ const TOPIC = "customers/redact";
  * sanitizeCompliancePayload) — contact info is omitted entirely, never stored.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { shop, topic, payload } = await authenticate.webhook(request);
+  const { shop, topic, payload } = await authenticateWebhook(request, MODULE);
   const p = (payload ?? {}) as Record<string, any>;
 
   try {
@@ -64,11 +67,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         `Anonymous visitor browsing data not tied to a customer identity was left intact.`,
     });
 
-    console.log(`${LOG_PREFIX} ${shop} frameworkTopic=${topic} canonical=${TOPIC} orders=${ordersToRedact.length} deletedEvents=${deleted}`);
+    logInfo(
+      { module: MODULE, shop_domain: shop },
+      `${LOG_PREFIX} ${shop} frameworkTopic=${topic} canonical=${TOPIC} orders=${ordersToRedact.length} deletedEvents=${deleted}`,
+    );
 
     return new Response();
   } catch (err) {
-    console.error(`${LOG_PREFIX} FAILED for ${shop}:`, err);
+    logError(
+      { module: MODULE, shop_domain: shop },
+      `${LOG_PREFIX} FAILED for ${shop}`,
+      err,
+    );
     throw err;
   }
 };

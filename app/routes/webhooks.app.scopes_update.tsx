@@ -1,9 +1,13 @@
 import type { ActionFunctionArgs } from "react-router";
-import { authenticate, sessionStorage } from "../shopify.server";
+import { sessionStorage } from "../shopify.server";
+import { authenticateWebhook } from "../utils/webhook-auth.server";
+import { logError, logInfo, logWarn } from "../utils/logger.server";
+
+const MODULE = "webhooks.app.scopes_update";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { payload, session, topic, shop } = await authenticate.webhook(request);
-  console.log(`Received ${topic} webhook for ${shop}`);
+  const { payload, session, topic, shop } = await authenticateWebhook(request, MODULE);
+  logInfo({ module: MODULE, shop_domain: shop }, `Received ${topic} webhook for ${shop}`);
 
   const current = payload.current as string[];
   if (session) {
