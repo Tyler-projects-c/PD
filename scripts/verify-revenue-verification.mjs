@@ -15,6 +15,17 @@
  *  11. reporting decision (effectiveRevenue) -> verified wins; raw is the
  *      fallback while pending; unverified rows still report (flagged)
  *  12. the DB CHECK constraint rejects a bogus verification_status
+ *  13. webhook-first race ledger (issue #3) -> webhook with no browser rows
+ *      parks the line; the LATE pixel insert consumes it via
+ *      reconcileLedgerForOrder and the row is verified immediately (no
+ *      redelivery needed); consumption is idempotent and the ledger row is
+ *      deleted; a null order id is a safe no-op
+ *  14. ledger mismatch path                 -> disagreement is a loud mismatch,
+ *      webhook still wins, the row is consumed either way
+ *  15. discounted orders (issue #4)         -> pre-discount unit price x
+ *      quantity MINUS discount_allocations is what gets compared/stored, so a
+ *      discounted order is verified instead of falsely mismatched (a no-
+ *      allocations baseline in the same test proves the fix is what prevents it)
  *
  * Every synthetic row is removed at the end (and on failure), so the harness is
  * re-runnable against a live dev database.
@@ -27,6 +38,7 @@ import { PrismaClient } from "@prisma/client";
 import {
   VERIFICATION_ROUNDING_THRESHOLD,
   normalizePaidOrder,
+  reconcileLedgerForOrder,
   sweepStaleVerifications,
   verifyPaidOrder,
 } from "../app/utils/order-verification.server.ts";
@@ -361,12 +373,232 @@ async function main() {
     constraintRow.verification_status === "verified",
     constraintRow.verification_status,
   );
+
+  // ---------------------------------------------------------------- 13
+  console.log("[13] webhook-first race -> ledger parks, the late pixel consumes it (issue #3)");
+  const o13 = ORDER(13);
+  const p13 = P(13);
+  const parked1 = await verifyPaidOrder(db, SHOP, {
+    id: Number(o13),
+    name: "#1013",
+    line_items: [line(p13, "42.00")],
+  });
+  const ledger13 = await db.webhook_revenue_ledger.findMany({
+    where: { shop_domain: SHOP, order_id: o13 },
+  });
+  check(
+    "webhook with NO browser rows parks the line in the ledger",
+    parked1.matchedRows === 0 && ledger13.length === 1 && Number(ledger13[0].amount) === 42,
+    `parked=${ledger13.length} amount=${ledger13.length ? Number(ledger13[0].amount) : "n/a"}`,
+  );
+  await browserCheckout({ product_id: p13, order_id: o13, revenue: 42 });
+  const beforeReconcile = await rowFor(o13, p13);
+  check(
+    "late pixel row lands pending (the pre-fix permanent state)",
+    beforeReconcile.verification_status === "pending",
+    beforeReconcile.verification_status,
+  );
+  const consumed1 = await reconcileLedgerForOrder(db, SHOP, o13);
+  const row13 = await rowFor(o13, p13);
+  check(
+    "pixel insert consumes the parked row -> verified immediately, no redelivery",
+    consumed1.consumed === 1 && consumed1.verified === 1 && row13.verification_status === "verified",
+    `consumed=${JSON.stringify(consumed1)} status=${row13.verification_status}`,
+  );
+  check(
+    "consumed amount lands on verified_revenue, raw untouched",
+    Number(row13.verified_revenue) === 42 && Number(row13.revenue) === 42,
+    `verified=${Number(row13.verified_revenue)} raw=${Number(row13.revenue)}`,
+  );
+  const ledger13After = await db.webhook_revenue_ledger.count({
+    where: { shop_domain: SHOP, order_id: o13 },
+  });
+  check("consumed ledger row is deleted", ledger13After === 0, String(ledger13After));
+  const consumedAgain = await reconcileLedgerForOrder(db, SHOP, o13);
+  check(
+    "reconcile is idempotent (nothing left to consume)",
+    consumedAgain.consumed === 0 && consumedAgain.verified === 0,
+    JSON.stringify(consumedAgain),
+  );
+  const consumedNoOrder = await reconcileLedgerForOrder(db, SHOP, null);
+  check(
+    "null order id is a safe no-op",
+    consumedNoOrder.consumed === 0 && consumedNoOrder.mismatched === 0,
+    JSON.stringify(consumedNoOrder),
+  );
+
+  // ---------------------------------------------------------------- 14
+  console.log("[14] ledger mismatch path -> mismatch status, webhook wins, row consumed");
+  const o14 = ORDER(14);
+  const p14 = P(14);
+  await verifyPaidOrder(db, SHOP, { id: Number(o14), line_items: [line(p14, "50.00")] });
+  await browserCheckout({ product_id: p14, order_id: o14, revenue: 40 });
+  const consumed2 = await reconcileLedgerForOrder(db, SHOP, o14);
+  const row14 = await rowFor(o14, p14);
+  check(
+    "browser/ledger disagreement -> mismatch, not a silent pass",
+    consumed2.mismatched === 1 && row14.verification_status === "mismatch",
+    `consumed=${JSON.stringify(consumed2)} status=${row14.verification_status}`,
+  );
+  check(
+    "webhook value wins on verified_revenue, raw kept",
+    Number(row14.verified_revenue) === 50 && Number(row14.revenue) === 40,
+    `verified=${Number(row14.verified_revenue)} raw=${Number(row14.revenue)}`,
+  );
+  const ledger14 = await db.webhook_revenue_ledger.count({
+    where: { shop_domain: SHOP, order_id: o14 },
+  });
+  check("mismatched ledger row is still consumed", ledger14 === 0, String(ledger14));
+
+  // ---------------------------------------------------------------- 15
+  console.log("[15] discounted order -> post-discount amount, no false mismatch (issue #4)");
+  const o15 = ORDER(15);
+  const p15 = P(15);
+  await browserCheckout({ product_id: p15, order_id: o15, revenue: 90 });
+  const r15 = await verifyPaidOrder(db, SHOP, {
+    id: Number(o15),
+    line_items: [
+      {
+        product_id: Number(p15),
+        price: "100.00",
+        quantity: 1,
+        discount_allocations: [{ amount: "10.00" }],
+      },
+    ],
+  });
+  const row15 = await rowFor(o15, p15);
+  check(
+    "pre-discount 100.00 minus a 10.00 allocation matches the pixel's 90 -> verified",
+    r15.verifiedRows === 1 && r15.mismatchRows === 0 && row15.verification_status === "verified",
+    JSON.stringify(r15),
+  );
+  check(
+    "verified_revenue stores the POST-discount amount (90)",
+    Number(row15.verified_revenue) === 90,
+    String(Number(row15.verified_revenue)),
+  );
+
+  // Pre-fix baseline: the SAME numbers WITHOUT discount_allocations is exactly
+  // what used to happen - pre-discount 100 vs browser 90 -> a false mismatch on
+  // every discounted order. This proves the subtraction is what prevents it.
+  const o16 = ORDER(16);
+  const p16 = P(16);
+  await browserCheckout({ product_id: p16, order_id: o16, revenue: 90 });
+  const r16 = await verifyPaidOrder(db, SHOP, {
+    id: Number(o16),
+    line_items: [line(p16, "100.00")],
+  });
+  check(
+    "pre-fix baseline: with no allocations it IS a mismatch (fix is load-bearing)",
+    r16.mismatchRows === 1 && r16.verifiedRows === 0,
+    JSON.stringify(r16),
+  );
+
+  // quantity x unit price, then the line's discount share
+  const o17 = ORDER(17);
+  const p17 = P(17);
+  await browserCheckout({ product_id: p17, order_id: o17, revenue: 45 });
+  const r17 = await verifyPaidOrder(db, SHOP, {
+    id: Number(o17),
+    line_items: [
+      {
+        product_id: Number(p17),
+        price: "25.00",
+        quantity: 2,
+        discount_allocations: [{ amount: "5.00" }],
+      },
+    ],
+  });
+  const row17 = await rowFor(o17, p17);
+  check(
+    "(2 x 25.00) - 5.00 = 45.00 verified",
+    r17.verifiedRows === 1 && Number(row17.verified_revenue) === 45,
+    JSON.stringify(r17),
+  );
+
+  // amount_set fallback + several allocations on one line are SUMMED
+  const o18 = ORDER(18);
+  const p18 = P(18);
+  const normalized18 = normalizePaidOrder({
+    id: Number(o18),
+    line_items: [
+      {
+        product_id: Number(p18),
+        price: "10.00",
+        quantity: 1,
+        discount_allocations: [
+          { amount_set: { shop_money: { amount: "5.00" } } },
+          { amount: "2.50" },
+        ],
+      },
+    ],
+  });
+  check(
+    "amount_set fallback + multiple allocations summed (10 - 5.00 - 2.50 = 2.50)",
+    normalized18.lines.get(p18) === 2.5 && normalized18.skippedLines === 0,
+    JSON.stringify([...normalized18.lines]),
+  );
+
+  // A discount larger than the line total must not produce a negative amount
+  const o19 = ORDER(19);
+  const p19 = P(19);
+  const normalized19 = normalizePaidOrder({
+    id: Number(o19),
+    line_items: [
+      {
+        product_id: Number(p19),
+        price: "10.00",
+        quantity: 1,
+        discount_allocations: [{ amount: "25.00" }],
+      },
+    ],
+  });
+  check(
+    "over-allocated discount clamps to 0.00, never negative",
+    normalized19.lines.get(p19) === 0,
+    JSON.stringify([...normalized19.lines]),
+  );
+
+  // Ledger path (test 13) must store the POST-discount amount too
+  const o20 = ORDER(20);
+  const p20 = P(20);
+  await verifyPaidOrder(db, SHOP, {
+    id: Number(o20),
+    line_items: [
+      {
+        product_id: Number(p20),
+        price: "100.00",
+        quantity: 1,
+        discount_allocations: [{ amount: "10.00" }],
+      },
+    ],
+  });
+  const ledger20 = await db.webhook_revenue_ledger.findFirst({
+    where: { shop_domain: SHOP, order_id: o20, product_id: p20 },
+  });
+  check(
+    "the ledger parks the post-discount amount as well (90, not 100)",
+    ledger20 !== null && Number(ledger20.amount) === 90,
+    ledger20 ? String(Number(ledger20.amount)) : "no ledger row",
+  );
+  await browserCheckout({ product_id: p20, order_id: o20, revenue: 90 });
+  const consumed20 = await reconcileLedgerForOrder(db, SHOP, o20);
+  const row20 = await rowFor(o20, p20);
+  check(
+    "discounted webhook-first race verifies on pixel insert (no false mismatch)",
+    consumed20.verified === 1 && row20.verification_status === "verified",
+    `consumed=${JSON.stringify(consumed20)} status=${row20.verification_status}`,
+  );
 }
 
 /** Remove every synthetic row so the harness can be re-run against a live DB. */
 async function cleanup() {
   const gone = await db.events.deleteMany({
     where: { shop_domain: SHOP, visitor_id: VISITOR },
+  });
+  // Parked webhook ledger rows are synthetic too (tests 7/13/14 write them).
+  const ledgerGone = await db.webhook_revenue_ledger.deleteMany({
+    where: { shop_domain: SHOP },
   });
   await db.visitors.deleteMany({ where: { visitor_id: VISITOR } });
   // Only ever drop the shop row when it is the synthetic one this script owns.
@@ -376,8 +608,14 @@ async function cleanup() {
   const leftover = await db.events.count({
     where: { shop_domain: SHOP, visitor_id: VISITOR },
   });
-  console.log(`[cleanup] synthetic events removed: ${gone.count}; leftover: ${leftover}`);
-  return leftover === 0;
+  const ledgerLeftover = await db.webhook_revenue_ledger.count({
+    where: { shop_domain: SHOP },
+  });
+  console.log(
+    `[cleanup] synthetic events removed: ${gone.count} (leftover: ${leftover});` +
+      ` ledger rows removed: ${ledgerGone.count} (leftover: ${ledgerLeftover})`,
+  );
+  return leftover === 0 && ledgerLeftover === 0;
 }
 
 main()

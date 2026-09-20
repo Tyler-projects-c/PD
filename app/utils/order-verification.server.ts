@@ -16,6 +16,15 @@
  * (e.g. a gift card or unmapped line), its amount is logged and skipped rather
  * than smeared across other lines.
  *
+ * WEBHOOK-FIRST RACE: the orders/paid webhook routinely beats the
+ * thank-you-page pixel, so NO browser rows exist yet when it arrives. A 200 has
+ * already been returned (Shopify redelivers only non-2xx), so the correct move
+ * is to PARK the post-discount per-line amounts in the webhook_revenue_ledger
+ * table (keyed by shop_domain/order_id/product_id). persistEvent in
+ * app/routes/api.events.tsx consumes the parked rows the moment the late
+ * checkout_completed rows are inserted and marks them verified/mismatch
+ * immediately - no redelivery needed or expected.
+ *
  * STATUS MODEL (per checkout row):
  *   pending    — no orders/paid webhook for this order_id yet (initial state).
  *   verified   — webhook matched and per-line revenue agrees within threshold.
@@ -96,6 +105,38 @@ function lineQuantity(line: PaidLineItem): number {
   if (!Number.isFinite(q) || q <= 0) return 1;
   return Math.floor(q);
 }
+/** Total discount allocated to one line via its discount_allocations entries. */
+function lineDiscountShare(line: PaidLineItem): number {
+  const entries = (line as PaidLineItem & { discount_allocations?: unknown }).discount_allocations;
+  if (!Array.isArray(entries)) return 0;
+  let total = 0;
+  for (const entry of entries) {
+    const e = entry as { amount?: unknown; amount_set?: { shop_money?: { amount?: unknown } } };
+    const n = finiteNumber(e.amount);
+    total += Number.isFinite(n) ? n : finiteNumber(e.amount_set?.shop_money?.amount) || 0;
+  }
+  return round2(total);
+}
+
+/**
+ * Post-discount authoritative amount for one webhook line.
+ *
+ * The webhook `price` (or the price_set fallback) is the PRE-discount unit
+ * price; the pixel reports the POST-discount finalLinePrice. Comparing the raw
+ * webhook amount against the browser value therefore produced a false
+ * mismatch on EVERY discounted order. Shopify reports each line share of
+ * the discount in `discount_allocations[].amount[_set]` - subtract the line total
+ * allocation from (unit price x quantity) before comparing or storing.
+ */
+function discountedLineAmount(line: PaidLineItem): number {
+  const unit = lineUnitPrice(line);
+  if (!Number.isFinite(unit)) return NaN;
+  const gross = unit * lineQuantity(line);
+  // Shopify never reports a line's final price below zero (a fully discounted
+  // line is 0.00), so clamp here too: an over-allocated discount must not push
+  // negative revenue into verified_revenue or the webhook ledger.
+  return round2(Math.max(0, gross - lineDiscountShare(line)));
+}
 
 export interface PaidOrderShape {
   id?: unknown;
@@ -122,13 +163,14 @@ export function normalizePaidOrder(payload: PaidOrderShape): {
   const rawLines = Array.isArray(payload.line_items) ? (payload.line_items as PaidLineItem[]) : [];
   for (const line of rawLines) {
     const pid = lineProductId(line);
-    const unit = lineUnitPrice(line);
-    if (!pid || !Number.isFinite(unit)) {
+    const amount = discountedLineAmount(line);
+    if (!pid || !Number.isFinite(amount)) {
       skippedLines++;
       continue;
     }
-    const qty = lineQuantity(line);
-    lines.set(pid, round2((lines.get(pid) ?? 0) + unit * qty));
+    // Multiple lines for the same product (split fulfillments, edits):
+    // SUM the post-discount amounts rather than letting the last line win.
+    lines.set(pid, round2((lines.get(pid) ?? 0) + amount));
   }
   const orderName = typeof payload.name === "string" && payload.name ? payload.name : null;
   return { orderId, lines, skippedLines, orderName };
@@ -147,6 +189,119 @@ export interface VerifyPaidOrderResult {
  * Never throws for data reasons (unknown shop, empty payload, no matching
  * rows are all logged, not fatal) — the route decides retry semantics.
  */
+/** Ledger upsert for the webhook-first race: park (or refresh) one line amount. */
+async function txLedgerUpsert(
+  db: PrismaClient,
+  shopDomain: string,
+  orderId: string,
+  productId: string,
+  amount: number,
+): Promise<void> {
+  await db.webhook_revenue_ledger.upsert({
+    where: { shop_domain_order_id_product_id: { shop_domain: shopDomain, order_id: orderId, product_id: productId } },
+    update: { amount, received_at: new Date() },
+    create: { shop_domain: shopDomain, order_id: orderId, product_id: productId, amount },
+  });
+}
+/**
+ * Consume parked webhook-first ledger rows for one order: called from
+ * persistEvent in app/routes/api.events.tsx right after the late
+ * checkout_completed rows are inserted. For every checkout row whose
+ * verification is still pending AND whose ledger entry exists, write the
+ * parked post-discount amount into verified_revenue with the correct status
+ * (verified within threshold, mismatch with a Sentry-visible warn otherwise)
+ * and delete the consumed ledger rows. Ledger rows with NO matching browser
+ * row are left parked (the pixel may still be in flight); rows older than 30
+ * days are pruned here since their browser row will never arrive.
+ */
+export async function reconcileLedgerForOrder(
+  db: PrismaClient,
+  shopDomain: string,
+  orderId: string | null | undefined,
+): Promise<{ consumed: number; verified: number; mismatched: number }> {
+  const empty = { consumed: 0, verified: 0, mismatched: 0 };
+  if (!orderId) return empty;
+  const parked = await db.webhook_revenue_ledger.findMany({
+    where: { shop_domain: shopDomain, order_id: orderId },
+  });
+  if (parked.length === 0) return empty;
+  const rows = await db.events.findMany({
+    where: {
+      shop_domain: shopDomain,
+      event_type: "checkout_completed",
+      order_id: orderId,
+      verification_status: "pending",
+    },
+  });
+  const parkedByProduct = new Map(parked.map((p) => [p.product_id, p]));
+  const now = new Date();
+  let consumed = 0;
+  let verified = 0;
+  let mismatched = 0;
+  for (const row of rows) {
+    const pid = row.product_id ?? "";
+    const entry = parkedByProduct.get(pid);
+    if (!entry) continue;
+    const webhookAmount = Number(entry.amount);
+    const browserAmount =
+      row.revenue === null || row.revenue === undefined ? NaN : Number(row.revenue);
+    const diff = Math.abs(webhookAmount - browserAmount);
+    const match = Number.isFinite(browserAmount) && diff <= VERIFICATION_ROUNDING_THRESHOLD;
+    if (match) {
+      verified++;
+    } else {
+      mismatched++;
+      logWarn(
+        { module: MODULE, shop_domain: shopDomain },
+        `${LOG} MISMATCH (ledger) ${shopDomain} orderId=${orderId} product=${pid}`,
+        {
+          extra: {
+            order_id: orderId,
+            product_id: pid,
+            browser_amount: Number.isFinite(browserAmount) ? browserAmount : null,
+            webhook_amount: webhookAmount,
+            diff: round2(diff),
+            source: "webhook_revenue_ledger",
+          },
+          sentry: true,
+        },
+      );
+    }
+    await db.events.update({
+      where: { event_id: row.event_id },
+      data: {
+        verified_revenue: webhookAmount,
+        verification_status: match ? "verified" : "mismatch",
+        verified_at: now,
+      },
+    });
+    await db.webhook_revenue_ledger.delete({
+      where: {
+        shop_domain_order_id_product_id: {
+          shop_domain: shopDomain,
+          order_id: orderId,
+          product_id: pid,
+        },
+      },
+    });
+    parkedByProduct.delete(pid);
+    consumed++;
+  }
+  const staleCutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  await db.webhook_revenue_ledger.deleteMany({
+    where: { shop_domain: shopDomain, order_id: orderId, received_at: { lt: staleCutoff } },
+  });
+  if (consumed > 0) {
+    logInfo(
+      { module: MODULE, shop_domain: shopDomain },
+      `${LOG} order ${orderId}: ledger reconcile consumed=${consumed} verified=${verified} mismatched=${mismatched}`,
+    );
+  }
+  return { consumed, verified, mismatched };
+}
+
+
+
 export async function verifyPaidOrder(
   db: PrismaClient,
   shopDomain: string,
@@ -177,21 +332,35 @@ export async function verifyPaidOrder(
     select: { event_id: true, product_id: true, revenue: true },
   });
   if (rows.length === 0) {
-    // No browser rows (yet) for this order: legitimate when the webhook wins
-    // the race (webhook delivery often beats the thank-you-page pixel). Log
-    // loudly — if rows NEVER arrive this is the signal — and let a later
-    // retry or reconciliation pass pick it up.
+    // Webhook-first race: orders/paid routinely beats the thank-you-page pixel,
+    // so NO browser rows exist yet. A 200 was already returned and Shopify
+    // redelivers only non-2xx, so PARK the post-discount per-line amounts in
+    // the webhook_revenue_ledger (keyed by shop_domain/order_id/product_id).
+    // persistEvent in app/routes/api.events.tsx consumes parked rows the moment
+    // the late checkout_completed rows are inserted - no redelivery needed.
+    let parked = 0;
+    for (const [pid, amount] of lines) {
+      try {
+        await txLedgerUpsert(db, shopDomain, orderId, pid, amount);
+        parked++;
+      } catch (error) {
+        logError(
+          { module: MODULE, shop_domain: shopDomain },
+          `${LOG} ${shopDomain} order ${orderId} product ${pid}: FAILED to park webhook amount ${amount} in the verification ledger`,
+          error,
+        );
+      }
+    }
     logWarn(
       { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} order ${orderId}${orderName ? ` (${orderName})` : ""}: ` +
-        `no checkout_completed rows yet for ${lines.size} webhook line(s); will retry on redelivery`,
+        `no checkout_completed rows yet for ${lines.size} webhook line(s); parked ${parked} in the verification ledger`,
     );
     return { order_id: orderId, matchedRows: 0, verifiedRows: 0, mismatchRows: 0, skippedLines };
   }
-
+  let mismatchRows = 0;
   let matchedRows = 0;
   let verifiedRows = 0;
-  let mismatchRows = 0;
   const now = new Date();
   for (const row of rows) {
     const pid = row.product_id ?? "";
@@ -285,3 +454,7 @@ export async function sweepStaleVerifications(
     return { marked: 0 };
   }
 }
+
+
+
+

@@ -1,12 +1,14 @@
-/**
- * Product/inventory sync — keeps products.price and products.inventory_available
- * populated and fresh. Two complementary channels, BOTH required:
+﻿/**
+ * Product/inventory sync — keeps products.price, products.inventory_available,
+ * and products.always_available populated and fresh. Two complementary
+ * channels, BOTH required:
  *
  *   1. WEBHOOK-DRIVEN (intraday): products/create, products/update,
  *      products/delete, inventory_levels/update (registered in
  *      shopify.app.toml; handlers in app/routes/webhooks.products.*.tsx and
  *      webhooks.inventory_levels.update.tsx). Each event upserts the affected
- *      product's price / inventory / inventory_item_ids in the local table.
+ *      product's price / inventory / inventory_item_ids / always_available in
+ *      the local table.
  *
  *   2. PERIODIC RECONCILIATION (self-correction): a full-catalog Admin API
  *      pull, once per UTC day per shop, piggybacked on the first ranking
@@ -28,6 +30,16 @@
  * (the common case) get the direct write; multi-item products cannot be summed
  * from one location event — the event is logged and the value is left to the
  * daily reconciliation, which sums variants' inventoryQuantity authoritatively.
+ *
+ * INVENTORY TRACKING (issue #7): a product is "always available" — purchasable
+ * regardless of inventory_available — when ANY variant is untracked
+ * (inventoryItem.tracked == false, e.g. gift cards, digital goods, "don't
+ * track inventory" products) OR continue-selling (inventoryPolicy == CONTINUE,
+ * oversell allowed). Tracked + DENY-when-out-of-stock variants contribute
+ * their real counts; the rollup only counts inventory that actually gates
+ * purchase. always_available is stored on the product row and used by
+ * buildCandidates() so genuinely-out-of-stock products are excluded while
+ * untracked/continue-selling products remain rankable.
  *
  * This module is PURE (no runtime imports beyond the logger): db and admin
  * are injected, so the verify harness (scripts/verify-product-sync.mjs) can
@@ -60,60 +72,116 @@ function finiteNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** Variant shapes from GraphQL Admin API (Product.node.variants) and REST webhooks. */
+export interface GraphqlVariant {
+  price?: string;
+  inventoryQuantity?: number | null;
+  /// `tracked` lives on InventoryItem. `inventoryPolicy` does NOT exist on
+  /// InventoryItem — the Admin API rejects that selection outright
+  /// ("Field 'inventoryPolicy' doesn't exist on type 'InventoryItem'") — it is a
+  /// ProductVariant field (DENY | CONTINUE) and must be queried at this level.
+  inventoryItem?: { id?: string; tracked?: boolean };
+  inventoryPolicy?: string | null;
+}
+export interface RestVariant {
+  id?: string | number;
+  price?: string;
+  inventory_quantity?: number | null;
+  inventory_item_id?: string | number;
+  inventory_management?: string | null;
+  tracked?: boolean;
+  inventory_policy?: string | null;
+}
+
 interface NormalizedProduct {
   product_id: string;
   title: string;
   created_at: Date;
-  price: number; // min variant price (cheapest purchasable unit)
-  inventory_available: number; // sum across variants
+  price: number;
+  inventory_available: number;
   inventory_item_ids: string[];
-  deleted_at: Date | null; // non-active == not purchasable == unrankable
+  deleted_at: Date | null;
+  always_available: boolean;
 }
 
 /**
- * Normalize a product from EITHER a REST webhook payload (products/create,
- * products/update — variants carry price/inventory_quantity/inventory_item_id)
- * OR a GraphQL Admin product node (id is a GID; variants carry
- * price/inventoryQuantity/inventoryItem.id). One mapping, two transport shapes.
+ * INVENTORY ROLLUP (issue #7): a product is "always available" when ANY
+ * variant is untracked (inventoryItem.tracked == false) OR continue-selling
+ * (inventoryPolicy == CONTINUE). Tracked + DENY variants contribute real counts.
  */
+interface VariantInventoryFlags {
+  quantity: number;
+  alwaysAvailable: boolean;
+}
+
+/**
+ * Is this variant's quantity actually tracked?
+ *   - GraphQL: the flag is InventoryItem.tracked (boolean).
+ *   - REST: ProductVariant.inventory_management is "shopify" when tracked and
+ *     null when the merchant chose "don't track quantity", so a field that is
+ *     PRESENT (even an explicit null) is authoritative.
+ * Returns null only when the payload carries no signal at all. Unknown is NOT
+ * treated as always-available: guessing would wrongly keep genuinely
+ * out-of-stock products rankable.
+ */
+function variantTracked(v: GraphqlVariant | RestVariant): boolean | null {
+  const direct = (v as { tracked?: unknown }).tracked;
+  if (typeof direct === "boolean") return direct;
+  const item = (v as { inventoryItem?: { tracked?: unknown } }).inventoryItem;
+  if (item && typeof item.tracked === "boolean") return item.tracked;
+  if ("inventory_management" in (v as object)) {
+    const management = (v as { inventory_management?: unknown }).inventory_management;
+    return typeof management === "string" && management.trim().toLowerCase() === "shopify";
+  }
+  return null;
+}
+
+function variantInventoryFlags(v: GraphqlVariant | RestVariant): VariantInventoryFlags {
+  const tracked = variantTracked(v);
+  // GraphQL returns the policy as ProductVariant.inventoryPolicy; REST webhooks
+  // send the same value as inventory_policy.
+  const policyRaw =
+    (v as { inventoryPolicy?: unknown }).inventoryPolicy ??
+    (v as { inventory_policy?: unknown }).inventory_policy;
+  const policy =
+    typeof policyRaw === "string" ? policyRaw.trim().toUpperCase() : null;
+  const alwaysAvailable = tracked === false || policy === "CONTINUE";
+  const inventoryQuantityRaw =
+    (v as { inventoryQuantity?: unknown }).inventoryQuantity !== undefined
+      ? (v as { inventoryQuantity?: unknown }).inventoryQuantity
+      : (v as { inventory_quantity?: unknown }).inventory_quantity;
+  const quantity =
+    inventoryQuantityRaw === null || inventoryQuantityRaw === undefined
+      ? 0
+      : Math.max(0, Math.floor(Number(inventoryQuantityRaw) || 0));
+  return { quantity, alwaysAvailable };
+}
+
 function normalizeProduct(raw: any): NormalizedProduct | null {
   if (!raw) return null;
   const productId = idFromGid(raw.id) || (raw.id != null ? String(raw.id) : "");
   if (!productId) return null;
-
   const variants: any[] = Array.isArray(raw.variants)
-    ? raw.variants // REST webhook shape: [{ id, price, inventory_quantity, inventory_item_id }]
+    ? raw.variants
     : Array.isArray(raw.variants?.edges)
-      ? raw.variants.edges.map((e: any) => e?.node ?? {}) // GraphQL shape
+      ? raw.variants.edges.map((e: any) => e?.node ?? {})
       : [];
-
-  const prices = variants
-    .map((v) => finiteNumber(v?.price))
-    .filter((p) => p > 0);
+  const prices = variants.map((v) => finiteNumber(v?.price)).filter((p) => p > 0);
   const price = prices.length > 0 ? Math.min(...prices) : 0;
-
   const inventoryItemIds: string[] = [];
   let inventoryAvailable = 0;
+  let alwaysAvailable = false;
   for (const v of variants) {
-    // REST: inventory_item_id ; GraphQL: inventoryItem.id (GID).
     const itemId =
       idFromGid(v?.inventoryItem?.id) ||
       (v?.inventory_item_id != null ? String(v.inventory_item_id) : "");
     if (itemId) inventoryItemIds.push(itemId);
-    // REST: inventory_quantity ; GraphQL: inventoryQuantity. Can be null when
-    // tracking is off — treat as 0 (reconciliation keeps it authoritative).
-    inventoryAvailable += Math.max(0, Math.trunc(finiteNumber(v?.inventory_quantity ?? v?.inventoryQuantity)));
+    const flags = variantInventoryFlags(v);
+    if (flags.alwaysAvailable) alwaysAvailable = true;
+    inventoryAvailable += flags.quantity;
   }
-
-  // REST/webhook payloads send the lowercase status ("active"); the GraphQL
-  // Admin API returns the uppercase ProductStatus enum ("ACTIVE", "DRAFT",
-  // "ARCHIVED"). Normalize the case before comparing — a case-sensitive
-  // check here silently flagged EVERY active product as deleted, which then
-  // cascaded into buildCandidates() excluding the whole catalog (unrankable
-  // shop) and into the reconciliation deletion sweep.
   const status = String(raw.status ?? "active").toLowerCase();
   const createdAtRaw = raw.created_at ?? raw.createdAt;
-
   return {
     product_id: productId,
     title: String(raw.title ?? ""),
@@ -122,6 +190,7 @@ function normalizeProduct(raw: any): NormalizedProduct | null {
     inventory_available: inventoryAvailable,
     inventory_item_ids: inventoryItemIds,
     deleted_at: status === "active" ? null : new Date(),
+    always_available: alwaysAvailable,
   };
 }
 
@@ -137,6 +206,7 @@ async function upsertNormalized(
     inventory_available: product.inventory_available,
     inventory_item_ids: product.inventory_item_ids,
     deleted_at: product.deleted_at,
+    always_available: product.always_available,
     last_synced_at: new Date(),
   };
   await db.products.upsert({
@@ -148,8 +218,7 @@ async function upsertNormalized(
 
 /**
  * WEBHOOK: products/create | products/update — upsert one product's synced
- * fields from the REST payload. Callers wrap in try/catch and rethrow so
- * Shopify retries genuine failures.
+ * fields from the REST payload.
  */
 export async function upsertProductFromWebhook(
   db: PrismaClient,
@@ -185,7 +254,7 @@ export async function markProductDeleted(
   payload: unknown,
 ): Promise<string | null> {
   const raw = (payload ?? {}) as any;
-  const productId = raw.id != null ? String(raw.id) : "";
+  const productId = String(raw.id ?? "");
   if (!productId) {
     logWarn(
       { module: MODULE, shop_domain: shopDomain },
@@ -205,7 +274,7 @@ export async function markProductDeleted(
     return null;
   }
   if (existing.deleted_at) {
-    return productId; // already flagged; idempotent
+    return productId;
   }
   await db.products.update({
     where: { product_id_shop_domain: { product_id: productId, shop_domain: shopDomain } },
@@ -216,10 +285,6 @@ export async function markProductDeleted(
 
 /**
  * WEBHOOK: inventory_levels/update — payload { inventory_item_id, available }.
- * Resolves the product LOCALLY via stored inventory_item_ids (no Admin API
- * round-trip). Single-item products get the direct write; multi-item products
- * cannot be summed from one per-location event — logged, left to the daily
- * reconciliation (which sums variant inventoryQuantity authoritatively).
  */
 export async function handleInventoryLevelUpdate(
   db: PrismaClient,
@@ -227,7 +292,7 @@ export async function handleInventoryLevelUpdate(
   payload: unknown,
 ): Promise<{ product_id: string | null; updated: boolean }> {
   const raw = (payload ?? {}) as any;
-  const itemId = raw.inventory_item_id != null ? String(raw.inventory_item_id) : "";
+  const itemId = String(raw.inventory_item_id ?? "");
   const available = Math.max(0, Math.trunc(finiteNumber(raw.available)));
   if (!itemId) {
     logWarn(
@@ -264,9 +329,18 @@ export async function handleInventoryLevelUpdate(
   return { product_id: product.product_id, updated: true };
 }
 
-const RECONCILE_QUERY = `#graphql
+/**
+ * The reconciliation pull's GraphQL document, exported so the cost probe
+ * (scripts/verify-graphql-cost.mjs) measures the REAL production query rather
+ * than a copy that can silently drift out of sync with it.
+ *
+ * `inventoryPolicy` is selected on the VARIANT (ProductVariant), NOT inside
+ * `inventoryItem`: InventoryItem has no such field and the API rejects the
+ * whole query when it is asked for there.
+ */
+export const RECONCILE_QUERY = `#graphql
   query ProductSyncPage($after: String) {
-    products(first: 250, after: $after, sortKey: ID) {
+    products(first: 25, after: $after, sortKey: ID) {
       edges {
         cursor
         node {
@@ -274,12 +348,16 @@ const RECONCILE_QUERY = `#graphql
           title
           status
           createdAt
-          variants(first: 100) {
+          variants(first: 50) {
             edges {
               node {
                 price
                 inventoryQuantity
-                inventoryItem { id }
+                inventoryPolicy
+                inventoryItem {
+                  id
+                  tracked
+                }
               }
             }
           }
@@ -292,11 +370,7 @@ const RECONCILE_QUERY = `#graphql
 
 /**
  * RECONCILIATION: full-catalog Admin API pull. Upserts EVERY product in the
- * shop's catalog (price/inventory/ids/status — this CREATES local rows for
- * products the shop has but we never saw a webhook for), flags local rows
- * ABSENT from the catalog as deleted (missed delete webhooks), and reports
- * counts. `admin` is the authenticated Admin API client (injected so the
- * verify harness can drive this without Shopify).
+ * shop's catalog AND flags local rows ABSENT from the catalog as deleted.
  */
 export async function reconcileShopProducts(
   db: PrismaClient,
@@ -306,21 +380,19 @@ export async function reconcileShopProducts(
   const seen = new Set<string>();
   let after: string | null = null;
   let pages = 0;
-
   for (;;) {
     pages += 1;
     if (pages > 100) {
-      // >25,000 products: almost certainly a bug (wrong shop?), stop loudly.
       logError(
-      { module: MODULE, shop_domain: shopDomain },
-      `${LOG} ${shopDomain} reconciliation exceeded 100 catalog pages; aborting pull (data so far still upserted)`,
-    );
+        { module: MODULE, shop_domain: shopDomain },
+        `${LOG} ${shopDomain} reconciliation exceeded 100 catalog pages; aborting pull (data so far still upserted)`,
+      );
       break;
     }
     const response = await admin.graphql(RECONCILE_QUERY, { variables: { after } });
     const body = await response.json();
     const connection = body?.data?.products;
-    if (!connection || !Array.isArray(connection.edges)) {
+    if (!connection || !Array.isArray(connection?.edges)) {
       throw new Error(`unexpected Admin API response shape on products page ${pages}`);
     }
     for (const edge of connection.edges) {
@@ -332,12 +404,6 @@ export async function reconcileShopProducts(
         );
         continue;
       }
-      if (product.inventory_item_ids.length > 100) {
-        logWarn(
-          { module: MODULE, shop_domain: shopDomain },
-          `${LOG} ${shopDomain} product ${product.product_id} has ${product.inventory_item_ids.length} variants; only the first 100 were pulled (webhooks + next run cover the rest)`,
-        );
-      }
       await upsertNormalized(db, shopDomain, product);
       seen.add(product.product_id);
     }
@@ -345,9 +411,6 @@ export async function reconcileShopProducts(
     after = connection.edges[connection.edges.length - 1]?.cursor ?? null;
     if (!after) break;
   }
-
-  // Missed-delete self-correction: local unflagged rows absent from the
-  // catalog are deleted-in-Shopify as far as we can know — flag them.
   const localActive = await db.products.findMany({
     where: { shop_domain: shopDomain, deleted_at: null },
     select: { product_id: true },
@@ -364,7 +427,6 @@ export async function reconcileShopProducts(
         ` (absent from the Shopify catalog — likely missed delete webhooks)`,
     );
   }
-
   return { synced: seen.size, markedDeleted: missing.length };
 }
 
@@ -376,9 +438,7 @@ function todayUtcMidnight(): Date {
 /**
  * CADENCE GATE: run the reconciliation pull at most ONCE per UTC day per shop
  * (stamp: shops.products_reconciled_at), piggybacked on the first ranking
- * request of the day. NEVER throws — a failed sync must not take ranking down
- * with it; failures log loudly and do NOT set the stamp, so the next ranking
- * request retries the pull.
+ * request of the day. NEVER throws.
  */
 export async function ensureShopProductsReconciled(
   db: PrismaClient,
@@ -391,10 +451,6 @@ export async function ensureShopProductsReconciled(
       select: { products_reconciled_at: true },
     });
     if (!shop) {
-      // unknown-shop signal: a ranking request carried a valid session for a
-      // shop we have NO local row for. That is an install/state divergence
-      // (failed install, partial wipe, wrong database) — worth a human, so it
-      // fans out to Sentry as well as printing.
       logWarn(
         { module: MODULE, shop_domain: shopDomain },
         `${LOG} ${shopDomain} not installed locally; skipping product reconciliation`,
@@ -403,7 +459,7 @@ export async function ensureShopProductsReconciled(
       return { ran: false };
     }
     if (shop.products_reconciled_at && shop.products_reconciled_at >= todayUtcMidnight()) {
-      return { ran: false }; // already reconciled today
+      return { ran: false };
     }
     const result = await reconcileShopProducts(db, shopDomain, admin);
     await db.shops.update({
@@ -416,7 +472,6 @@ export async function ensureShopProductsReconciled(
     );
     return { ran: true, synced: result.synced, markedDeleted: result.markedDeleted };
   } catch (error) {
-    // LOUD failure, no stamp: the next ranking request retries the pull.
     logError(
       { module: MODULE, shop_domain: shopDomain },
       `${LOG} ${shopDomain} daily product reconciliation FAILED (will retry on next ranking request)`,

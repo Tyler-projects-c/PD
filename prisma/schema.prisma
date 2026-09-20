@@ -51,6 +51,26 @@ model events {
   @@index([shop_domain, verification_status, occurred_at])
 }
 
+/// Webhook-first verification ledger: orders/paid amounts parked here when the
+/// webhook arrives BEFORE the browser's checkout_completed row exists (the
+/// common race - webhook delivery beats the thank-you-page pixel). Keyed by
+/// (shop_domain, order_id, product_id); persistEvent in app/routes/api.events.tsx
+/// consumes rows on checkout insert and marks the new row verified/mismatch
+/// immediately. Rows whose browser row arrives later are consumed and deleted
+/// by the same path, so the ledger only holds genuinely unmatched lines.
+model webhook_revenue_ledger {
+  shop_domain  String
+  order_id     String
+  product_id   String
+  /// Per-line authoritative amount, post-discount (webhook price x quantity
+  /// minus discount_allocations - see app/utils/order-verification.server.ts).
+  amount       Decimal @db.Decimal(12, 2)
+  received_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  @@id([shop_domain, order_id, product_id])
+  @@index([shop_domain, order_id], map: "idx_ledger_order")
+}
+
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model experiment_assignments {
   visitor_id    String   @db.Uuid
@@ -118,6 +138,12 @@ model products {
   is_excluded           Boolean                 @default(false)
   launch_window_end     DateTime?               @db.Timestamptz(6)
   last_synced_at        DateTime                @default(now()) @db.Timestamptz(6)
+  /// True when at least one variant is untracked OR continue-selling: the
+  /// product is legitimately always purchasable, so the candidate filter must
+  /// NOT require inventory_available > 0 for it (see
+  /// app/utils/thompson-ranking.server.ts and the INVENTORY ROLLUP note on
+  /// normalizeProduct in app/utils/product-sync.server.ts).
+  always_available Boolean                @default(false)
   /// Set by product-sync (webhooks + reconciliation): product deleted in
   /// Shopify, or draft/archived, or absent from a reconciliation pull. The row
   /// is KEPT (it is the FK parent of product_surface_stats — deleting would

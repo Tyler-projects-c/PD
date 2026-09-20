@@ -2,6 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { z } from "zod";
 import db from "../db.server";
 import { assignVisitorToExperiment } from "../utils/experiments.server";
+import { reconcileLedgerForOrder } from "../utils/order-verification.server";
 import { logError, logInfo, logWarn } from "../utils/logger.server";
 
 /**
@@ -250,6 +251,19 @@ async function persistEvent(payload: EventPayload, effectiveVisitorId: string) {
         return;
       }
       throw error;
+    }
+    // Webhook-first race: orders/paid routinely beats the thank-you-page
+    // pixel, so a ledger row keyed by (shop/order_id/product_id) may already
+    // be parked (see verifyPaidOrder in order-verification.server.ts). Consume
+    // it NOW and mark the just-inserted row verified/mismatch immediately —
+    // waiting for a redelivery that will never come (200s are not retried) is
+    // exactly what left these rows permanently pending before.
+    if (payload.event_type === "checkout_completed") {
+      await reconcileLedgerForOrder(
+        db,
+        payload.shop_domain,
+        payload.order_id ?? null,
+      );
     }
     return;
   }

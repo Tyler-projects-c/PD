@@ -249,11 +249,18 @@ register(({analytics, browser, init, settings}) => {
       order_id: extractNumericId(checkout?.order?.id),
       revenue: checkout?.totalPrice?.amount ?? null,
       line_items: lineItems.map((lineItem) => ({
-        product_id: extractNumericId(lineItem?.merchandise?.product?.id),
-        revenue:
-          lineItem?.cost?.totalAmount?.amount ??
-          lineItem?.finalLinePrice?.amount ??
-          null,
+        // CheckoutLineItem field audit against the Web Pixels API docs (2026-07,
+        // checkout_completed event spec): CheckoutLineItem exposes variant (NOT
+        // `merchandise` — that is CartLine) and has NO `cost` field (the only
+        // cost fields in this event are on DeliveryOption). Both were dead
+        // references here; `merchandise` nulled product_id on every real
+        // checkout row. revenue uses finalLinePrice = the line's price after
+        // LINE-level discounts; order-level discount allocations are reported
+        // separately in lineItem.discountAllocations (not subtracted here, so a
+        // discounted order may verify as mismatch — the webhook still wins and
+        // verified_revenue carries the authoritative post-discount amount).
+        product_id: extractNumericId(lineItem?.variant?.product?.id),
+        revenue: lineItem?.finalLinePrice?.amount ?? null,
       })),
     });
   });

@@ -158,13 +158,20 @@ export async function buildCandidates(opts: {
     db.products.findMany({
       where: {
         shop_domain,
-        is_excluded: false,
-        inventory_available: { gt: 0 },
+                is_excluded: false,
+        // Exclude genuinely-out-of-stock products, but NOT untracked or
+        // continue-selling ones (issue #7): always_available products are
+        // legitimately purchasable at any inventory level (gift cards, digital
+        // goods, "don't track inventory", continue-selling/oversell).
+        OR: [
+          { inventory_available: { gt: 0 } },
+          { always_available: true },
+        ],
         // Deleted-in-Shopify / draft / archived products are unrankable
         // (flagged by product-sync, never deleted locally — see module doc).
         deleted_at: null,
       },
-      select: { product_id: true, price: true },
+      select: { product_id: true, price: true, always_available: true },
     }),
     db.product_surface_stats.findMany({
       where: { shop_domain, surface, surface_ref },

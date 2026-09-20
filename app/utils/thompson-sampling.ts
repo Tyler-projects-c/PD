@@ -35,10 +35,10 @@
  *     degenerate all-zero-weighted ranking (products.price defaults to 0 and
  *     no sync populates it yet, so this fallback is the live behavior today).
  *   - In the weighted path, a minority unpriced candidate gets a NEUTRAL
- *     weight of 1.0, not 0 — a zero multiplier would silently pin it to last
- *     place for missing data.
- *
- * This module contains NO database or Shopify imports and performs no I/O — it
+ *     weight equal to the MEDIAN unit price of the priced candidates in the
+ *     same pool, not a flat 1.0 — a flat 1.0 makes unpriced products sink to
+ *     the bottom against priced ones (the opposite of intent). The median is
+ *     a neutral stand-in: unaffected by outliers, representing a typical
  * is a pure, independently unit-testable scoring function.
  */
 
@@ -180,8 +180,9 @@ export function sampleBetaForCandidate(
  * price (expected revenue per impression) when price data is usable:
  *
  *   - priced minority (unpriced fraction <= REVENUE_WEIGHT_FALLBACK_FRACTION):
- *     sort by sampled_CVR * price, with unpriced candidates weighted 1.0
- *     (neutral — missing data must not zero a product out of the ranking).
+ *     sort by sampled_CVR * price, with unpriced candidates weighted by the
+ *     MEDIAN unit price of the priced candidates in the pool (a neutral
+ *     stand-in — a flat 1.0 would sink them below every priced product).
  *   - unpriced majority (> the fallback fraction): loud structured warn and sort
  *     by raw sampled_CVR — the exact pre-weighting behavior. This is the live
  *     path today (no price sync exists).
@@ -196,6 +197,25 @@ export function rankByThompsonSampling(
 ): string[] {
   const rng = options.rng ?? Math.random;
   const seen = new Set<string>();
+  // Neutral price weight for unpriced candidates in the weighted path: the MEDIAN
+  // unit price of the priced candidates in this pool. Computed once here (not per-
+  // candidate) so it is stable across all unpriced members of the same ranking
+  // call. Falls back to 1.0 if there are no priced peers (degenerate but safe —
+  // pure-CVR ranking of everything would behave identically).
+  const priced = candidates
+    .map((c) => c.price)
+    .filter(
+      (p): p is number =>
+        typeof p === "number" && Number.isFinite(p) && p > 0,
+    )
+    .sort((a, b) => a - b);
+  const neutralPriceWeight =
+    priced.length === 0
+      ? 1
+      : priced.length % 2 === 1
+        ? priced[Math.floor(priced.length / 2)]
+        : (priced[priced.length / 2 - 1] + priced[priced.length / 2]) / 2;
+
   const sampled = candidates.map((candidate) => {
     const productId = String(candidate.product_id);
     if (seen.has(productId)) {
@@ -206,13 +226,15 @@ export function rankByThompsonSampling(
     return {
       productId,
       sample: sampleBeta(alpha, beta, rng),
-      // Neutral 1.0 weight for unpriced candidates (weighted path only).
+      // Neutral weight for unpriced candidates: median of priced peers, not a
+      // flat 1.0 (a flat 1.0 makes unpriced products sink against priced ones).
+      // Falls back to 1.0 if there are no priced peers in this pool.
       priceWeight:
         typeof candidate.price === "number" &&
         Number.isFinite(candidate.price) &&
         candidate.price > 0
           ? candidate.price
-          : 1,
+          : neutralPriceWeight,
     };
   });
   if (sampled.length === 0) {
@@ -239,7 +261,8 @@ export function rankByThompsonSampling(
     return sampled.map(({ productId }) => productId);
   }
 
-  // Weighted path: price weight already defaults to 1.0 for unpriced candidates.
+  // Weighted path: unpriced candidates use the neutral price weight
+  // (median of priced peers).
   sampled.sort(
     (a, b) => b.sample * b.priceWeight - a.sample * a.priceWeight,
   );
